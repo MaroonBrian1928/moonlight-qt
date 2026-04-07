@@ -182,7 +182,8 @@ public:
     Q_PROPERTY(bool reverseScrollDirection MEMBER reverseScrollDirection NOTIFY reverseScrollDirectionChanged)
     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
-    Q_PROPERTY(int audioQueueThresholdMs MEMBER audioQueueThresholdMs NOTIFY audioQueueThresholdMsChanged)
+    Q_PROPERTY(int audioPlaybackThresholdMs MEMBER audioPlaybackThresholdMs NOTIFY audioPlaybackThresholdMsChanged)
+    Q_PROPERTY(int audioDropThresholdMs MEMBER audioDropThresholdMs NOTIFY audioDropThresholdMsChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
     Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged)
     Q_PROPERTY(AudioRenderer audioRenderer MEMBER audioRenderer NOTIFY audioRendererChanged)
@@ -222,7 +223,8 @@ public:
     bool reverseScrollDirection;
     bool swapFaceButtons;
     bool keepAwake;
-    int audioQueueThresholdMs;
+    int audioPlaybackThresholdMs;
+    int audioDropThresholdMs;
     int packetSize;
     AudioConfig audioConfig;
     SpatialAudioConfig spatialAudioConfig;
@@ -278,7 +280,8 @@ signals:
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
     void keepAwakeChanged();
-    void audioQueueThresholdMsChanged();
+    void audioPlaybackThresholdMsChanged();
+    void audioDropThresholdMsChanged();
     void languageChanged();
     void audioRendererChanged();
     void rendererChanged();
