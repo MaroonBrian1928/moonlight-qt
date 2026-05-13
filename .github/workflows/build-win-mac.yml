@@ -29,17 +29,35 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v5
         with:
-          submodules: 'recursive'
           fetch-depth: 1
 
-      - name: Download dependencies (Windows)
-        if: runner.os == 'Windows'
-        run: powershell ./setup-deps.ps1
+      - name: Cache submodules
+        uses: actions/cache@v4
+        with:
+          path: |
+            .git/modules
+            moonlight-common-c/moonlight-common-c
+            qmdnsengine/qmdnsengine
+            app/SDL_GameControllerDB
+            h264bitstream/h264bitstream
+            libs
+            imgui/imgui
+            imgui/implot
+          key: submodules-${{ runner.os }}-${{ hashFiles('.gitmodules') }}-${{ github.sha }}
+          restore-keys: |
+            submodules-${{ runner.os }}-${{ hashFiles('.gitmodules') }}-
+
+      - name: Initialize submodules
+        run: git submodule update --init --recursive --depth 1
 
       - name: Install create-dmg (macOS)
-        run: |
-          brew install node
-          npm install --global create-dmg
+        run: npm install --global create-dmg
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: macos-15-qt${{ env.QT_VERSION }}
+          max-size: 500M
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4

@@ -43,7 +43,11 @@ mkdir $INSTALLER_FOLDER
 
 echo Configuring the project
 pushd $BUILD_FOLDER
-qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" || fail "Qmake failed!"
+if command -v ccache >/dev/null 2>&1; then
+  qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" QMAKE_CC="ccache clang" QMAKE_CXX="ccache clang++" QMAKE_OBJECTIVE_CC="ccache clang++" || fail "Qmake failed!"
+else
+  qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" || fail "Qmake failed!"
+fi
 popd
 
 echo Compiling Moonlight in $BUILD_CONFIG configuration
