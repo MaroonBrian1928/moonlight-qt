@@ -23,7 +23,7 @@ jobs:
     env:
       # This handles input from either a workflow_call or a manual trigger
       CI_VERSION: ${{ inputs.ci_version || github.event.inputs.ci_version }}
-      QT_VERSION: 6.10.2
+      QT_VERSION: 6.11.1
 
     steps:
       - name: Checkout Repository
