@@ -20,9 +20,11 @@
 #define SER_FULLSCREEN "fullscreen"
 #define SER_VSYNC "vsync"
 #define SER_GAMEOPTS "gameopts"
+#define SER_HEADTRACKING "headtracking"
 #define SER_HOSTAUDIO "hostaudio"
 #define SER_MULTICONT "multicontroller"
 #define SER_AUDIOCFG "audiocfg"
+#define SER_SPATIALAUDIOCFG "spatialaudiocfg"
 #define SER_VIDEOCFG "videocfg"
 #define SER_HDR "hdr"
 #define SER_YUV444 "yuv444"
@@ -50,9 +52,35 @@
 #define SER_SWAPFACEBUTTONS "swapfacebuttons"
 #define SER_CAPTURESYSKEYS "capturesyskeys"
 #define SER_KEEPAWAKE "keepawake"
+#define SER_AUDIOPLAYBACKTHRESHOLDMS "audioplaybackthresholdms"
+#define SER_AUDIODROPTHRESHOLDMS "audiodropthresholdms"
+#define SER_AUDIOQUEUETHRESHOLDMS "audioqueuethresholdms"
 #define SER_LANGUAGE "language"
+#define SER_RENDERER "renderer"
+#define SER_FRAMEPACINGMODE "framePacingMode"
+#define SER_FRAMEPRESENTMODE "presentMode"
+#define SER_SHOWPERFORMANCEGRAPHS "showPerformanceGraphs"
+#define SER_VTMETALFRAMESINFLIGHT "vtMetalFramesInFlight"
 
 #define CURRENT_DEFAULT_VER 2
+
+namespace {
+constexpr int kDefaultAudioPlaybackThresholdMs = 0;
+constexpr int kDefaultAudioDropThresholdMs = 30;
+constexpr int kMinimumAudioPlaybackThresholdMs = 0;
+constexpr int kMinimumAudioDropThresholdMs = 1;
+constexpr int kMaximumAudioThresholdMs = 1000;
+
+int clampAudioPlaybackThreshold(int value)
+{
+    return qBound(kMinimumAudioPlaybackThresholdMs, value, kMaximumAudioThresholdMs);
+}
+
+int clampAudioDropThreshold(int value)
+{
+    return qBound(kMinimumAudioDropThresholdMs, value, kMaximumAudioThresholdMs);
+}
+}
 
 static StreamingPreferences* s_GlobalPrefs;
 
@@ -150,11 +178,18 @@ void StreamingPreferences::reload()
     reverseScrollDirection = settings.value(SER_REVERSESCROLL, false).toBool();
     swapFaceButtons = settings.value(SER_SWAPFACEBUTTONS, false).toBool();
     keepAwake = settings.value(SER_KEEPAWAKE, true).toBool();
+    audioPlaybackThresholdMs = clampAudioPlaybackThreshold(settings.value(SER_AUDIOPLAYBACKTHRESHOLDMS,
+                                                                          kDefaultAudioPlaybackThresholdMs).toInt());
+    audioDropThresholdMs = clampAudioDropThreshold(settings.value(SER_AUDIODROPTHRESHOLDMS,
+                                                                  settings.value(SER_AUDIOQUEUETHRESHOLDMS,
+                                                                                 kDefaultAudioDropThresholdMs).toInt()).toInt());
     enableHdr = settings.value(SER_HDR, false).toBool();
     captureSysKeysMode = static_cast<CaptureSysKeysMode>(settings.value(SER_CAPTURESYSKEYS,
                                                          static_cast<int>(CaptureSysKeysMode::CSK_OFF)).toInt());
     audioConfig = static_cast<AudioConfig>(settings.value(SER_AUDIOCFG,
                                                   static_cast<int>(AudioConfig::AC_STEREO)).toInt());
+    spatialAudioConfig = static_cast<SpatialAudioConfig>(settings.value(SER_SPATIALAUDIOCFG,
+                                                  static_cast<int>(SpatialAudioConfig::SAC_DISABLED)).toInt());
     videoCodecConfig = static_cast<VideoCodecConfig>(settings.value(SER_VIDEOCFG,
                                                   static_cast<int>(VideoCodecConfig::VCC_AUTO)).toInt());
     videoDecoderSelection = static_cast<VideoDecoderSelection>(settings.value(SER_VIDEODEC,
@@ -168,6 +203,22 @@ void StreamingPreferences::reload()
                                                                                                                  : UIDisplayMode::UI_MAXIMIZED)).toInt());
     language = static_cast<Language>(settings.value(SER_LANGUAGE,
                                                     static_cast<int>(Language::LANG_AUTO)).toInt());
+    renderer = static_cast<Renderer>(settings.value(SER_RENDERER,
+                                                    static_cast<int>(Renderer::RENDERER_VT_METAL)).toInt());
+    framePacingMode = static_cast<FramePacingMode>(settings.value(SER_FRAMEPACINGMODE,
+                                                   static_cast<int>(FramePacingMode::FRAME_PACING_IMMEDIATE)).toInt());
+    presentMode = static_cast<PresentMode>(settings.value(SER_FRAMEPRESENTMODE,
+                                                    static_cast<int>(PresentMode::PRESENT_AUTO)).toInt());
+    showPerformanceGraphs = settings.value(SER_SHOWPERFORMANCEGRAPHS, false).toBool();
+    vtMetalFramesInFlight = settings.value(SER_VTMETALFRAMESINFLIGHT, 3).toInt();
+
+    // old enableVsync is now based on presentMode
+    if (presentMode == PresentMode::PRESENT_NO_VSYNC) {
+        enableVsync = false;
+    }
+    else {
+        enableVsync = true;
+    }
 
 
     // Perform default settings updates as required based on last default version
@@ -343,6 +394,7 @@ void StreamingPreferences::save()
     settings.setValue(SER_DETECTNETBLOCKING, detectNetworkBlocking);
     settings.setValue(SER_SHOWPERFOVERLAY, showPerformanceOverlay);
     settings.setValue(SER_AUDIOCFG, static_cast<int>(audioConfig));
+    settings.setValue(SER_SPATIALAUDIOCFG, static_cast<int>(spatialAudioConfig));
     settings.setValue(SER_HDR, enableHdr);
     settings.setValue(SER_YUV444, enableYUV444);
     settings.setValue(SER_VIDEOCFG, static_cast<int>(videoCodecConfig));
@@ -358,6 +410,14 @@ void StreamingPreferences::save()
     settings.setValue(SER_SWAPFACEBUTTONS, swapFaceButtons);
     settings.setValue(SER_CAPTURESYSKEYS, captureSysKeysMode);
     settings.setValue(SER_KEEPAWAKE, keepAwake);
+    settings.setValue(SER_RENDERER, static_cast<int>(renderer));
+    settings.setValue(SER_FRAMEPACINGMODE, static_cast<int>(framePacingMode));
+    settings.setValue(SER_FRAMEPRESENTMODE, static_cast<int>(presentMode));
+    settings.setValue(SER_SHOWPERFORMANCEGRAPHS, showPerformanceGraphs);
+    settings.setValue(SER_VTMETALFRAMESINFLIGHT, vtMetalFramesInFlight);
+    settings.setValue(SER_AUDIOPLAYBACKTHRESHOLDMS, clampAudioPlaybackThreshold(audioPlaybackThresholdMs));
+    settings.setValue(SER_AUDIODROPTHRESHOLDMS, clampAudioDropThreshold(audioDropThresholdMs));
+    settings.setValue(SER_AUDIOQUEUETHRESHOLDMS, clampAudioDropThreshold(audioDropThresholdMs));
 }
 
 int StreamingPreferences::getDefaultBitrate(int width, int height, int fps, bool yuv444)

@@ -36,6 +36,10 @@ DEFINES += QT_DEPRECATED_WARNINGS
 DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
 
 win32 {
+    !exists($$PWD/../libs/windows) {
+        error("Missing dependencies. Please run 'powershell .\setup-deps.ps1' to fetch prebuilt libraries.")
+    }
+
     contains(QT_ARCH, x86_64) {
         LIBS += -L$$PWD/../libs/windows/lib/x64
         INCLUDEPATH += $$PWD/../libs/windows/include/x64 $$PWD/../libs/windows/include/x64/SDL2
@@ -49,6 +53,10 @@ win32 {
     LIBS += ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib
 }
 macx:!disable-prebuilts {
+    !exists($$PWD/../libs/mac) {
+        error("Missing dependencies. Please run 'python3 setup-deps.py' to fetch prebuilt libraries.")
+    }
+
     INCLUDEPATH += $$PWD/../libs/mac/include $$PWD/../libs/mac/include/SDL2
     LIBS += -L$$PWD/../libs/mac/lib
 }
@@ -153,7 +161,21 @@ macx {
         CONFIG += discord-rpc
     }
 
-    LIBS += -lobjc -framework VideoToolbox -framework AVFoundation -framework CoreVideo -framework CoreGraphics -framework CoreMedia -framework AppKit -framework Metal -framework QuartzCore
+    LIBS += -lobjc \
+        -framework Accelerate \
+        -framework AppKit \
+        -framework AudioToolbox \
+        -framework AudioUnit \
+        -framework AVFoundation \
+        -framework CoreAudio \
+        -framework CoreGraphics \
+        -framework CoreMedia \
+        -framework CoreVideo \
+        -framework GameController \
+        -framework Metal \
+        -framework MetalKit \
+        -framework QuartzCore \
+        -framework VideoToolbox
     CONFIG += ffmpeg
 }
 
@@ -189,6 +211,7 @@ SOURCES += \
     gui/computermodel.cpp \
     gui/appmodel.cpp \
     streaming/bandwidth.cpp \
+    streaming/floatbuffer.cpp \
     streaming/streamutils.cpp \
     backend/autoupdatechecker.cpp \
     path.cpp \
@@ -196,7 +219,11 @@ SOURCES += \
     gui/sdlgamepadkeynavigation.cpp \
     streaming/video/overlaymanager.cpp \
     backend/systemproperties.cpp \
-    wm.cpp
+    wm.cpp \
+    imgui/devui.cpp \
+    imgui/gamepadmenu.cpp \
+    imgui/imgui_plots.cpp \
+    streaming/stats.cpp
 
 HEADERS += \
     SDL_compat.h \
@@ -227,13 +254,19 @@ HEADERS += \
     gui/appmodel.h \
     streaming/video/decoder.h \
     streaming/bandwidth.h \
+    streaming/floatbuffer.h \
     streaming/streamutils.h \
     backend/autoupdatechecker.h \
     path.h \
     settings/mappingmanager.h \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
-    backend/systemproperties.h
+    backend/systemproperties.h \
+    imgui/devui.h \
+    imgui/gamepadmenu.h \
+    imgui/plotdesc.h \
+    imgui/imgui_plots.h \
+    streaming/stats.h
 
 # Platform-specific renderers and decoders
 ffmpeg {
@@ -245,7 +278,9 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/genhwaccel.cpp \
         streaming/video/ffmpeg-renderers/sdlvid.cpp \
         streaming/video/ffmpeg-renderers/swframemapper.cpp \
-        streaming/video/ffmpeg-renderers/pacer/pacer.cpp
+        streaming/video/ffmpeg-renderers/framepacing/framecadence.cpp \
+        streaming/video/ffmpeg-renderers/framepacing/framepacer.cpp \
+        streaming/video/ffmpeg-renderers/framepacing/framequeue.cpp
 
     HEADERS += \
         streaming/video/ffmpeg.h \
@@ -253,7 +288,9 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/genhwaccel.h \
         streaming/video/ffmpeg-renderers/sdlvid.h \
         streaming/video/ffmpeg-renderers/swframemapper.h \
-        streaming/video/ffmpeg-renderers/pacer/pacer.h
+        streaming/video/ffmpeg-renderers/framepacing/framecadence.h \
+        streaming/video/ffmpeg-renderers/framepacing/framepacer.h \
+        streaming/video/ffmpeg-renderers/framepacing/framequeue.h
 }
 libva {
     message(VAAPI renderer selected)
@@ -393,14 +430,31 @@ win32:!winrt {
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }
 macx {
-    message(VideoToolbox renderer selected)
+    message(CoreAudio + VideoToolbox renderers selected)
+
+    DEFINES += HAVE_COREAUDIO
+
+    # ImGui can be disabled completely with this define
+    # DEFINES += IMGUI_DISABLE
+
+    # QMAKE_OBJECTIVE_CFLAGS = -fobjc-arc
 
     SOURCES += \
+        streaming/audio/renderers/coreaudio/au_spatial_renderer.mm \
+        streaming/audio/renderers/coreaudio/coreaudio.cpp \
+        streaming/audio/renderers/coreaudio/TPCircularBuffer.c \
+        streaming/streamutils_mac.mm \
+        streaming/video/ffmpeg-renderers/pacer/displaylink_source.mm \
         streaming/video/ffmpeg-renderers/vt_base.mm \
         streaming/video/ffmpeg-renderers/vt_avsamplelayer.mm \
         streaming/video/ffmpeg-renderers/vt_metal.mm
 
     HEADERS += \
+        streaming/audio/renderers/coreaudio/au_spatial_renderer.h \
+        streaming/audio/renderers/coreaudio/coreaudio.h \
+        streaming/audio/renderers/coreaudio/coreaudio_helpers.h \
+        streaming/audio/renderers/coreaudio/TPCircularBuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/displaylink_source.h \
         streaming/video/ffmpeg-renderers/vt.h
 }
 discord-rpc {
@@ -499,6 +553,13 @@ else:unix: LIBS += -L$$OUT_PWD/../h264bitstream/ -lh264bitstream
 
 INCLUDEPATH += $$PWD/../h264bitstream/h264bitstream
 DEPENDPATH += $$PWD/../h264bitstream/h264bitstream
+
+win32:CONFIG(release, debug|release): LIBS += -L$$OUT_PWD/../imgui/release/ -limgui
+else:win32:CONFIG(debug, debug|release): LIBS += -L$$OUT_PWD/../imgui/debug/ -limgui
+else:unix: LIBS += -L$$OUT_PWD/../imgui/ -limgui
+
+INCLUDEPATH += $$PWD/../imgui/imgui $$PWD/../imgui/imgui/backends $$PWD/../imgui/implot
+DEPENDPATH += $$PWD/../imgui/imgui
 
 !winrt {
     win32:CONFIG(release, debug|release): LIBS += -L$$OUT_PWD/../AntiHooking/release/ -lAntiHooking

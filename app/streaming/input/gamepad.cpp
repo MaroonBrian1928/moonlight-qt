@@ -3,6 +3,7 @@
 #include <Limelight.h>
 #include "SDL_compat.h"
 #include "settings/mappingmanager.h"
+#include "imgui/gamepadmenu.h"
 
 #include <QtMath>
 
@@ -151,6 +152,30 @@ void SdlInputHandler::sendGamepadBatteryState(GamepadState* state, SDL_JoystickP
     }
 
     LiSendControllerBatteryEvent(state->index, batteryState, batteryPercentage);
+}
+
+void SdlInputHandler::toggleMouseEmulation(SDL_JoystickID jsid)
+{
+    GamepadState* state = findStateForGamepad(jsid);
+    if (state == NULL) {
+        return;
+    }
+
+    if (state->mouseEmulationTimer != 0) {
+        SDL_RemoveTimer(state->mouseEmulationTimer);
+        state->mouseEmulationTimer = 0;
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Mouse emulation deactivated");
+        Session::get()->notifyMouseEmulationMode(false);
+    }
+    else {
+        state->mouseEmulationTimer = SDL_AddTimer(MOUSE_EMULATION_POLLING_INTERVAL, SdlInputHandler::mouseEmulationTimerCallback, state);
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Mouse emulation active");
+        Session::get()->notifyMouseEmulationMode(true);
+    }
 }
 
 Uint32 SdlInputHandler::mouseEmulationTimerCallback(Uint32 interval, void *param)
@@ -750,7 +775,7 @@ void SdlInputHandler::handleControllerDeviceEvent(SDL_ControllerDeviceEvent* eve
                         state->index);
 
             // Send a final event to let the PC know this gamepad is gone
-            LiSendMultiControllerEvent(state->index, m_GamepadMask,
+            LiSendMultiControllerEvent(0, m_GamepadMask,
                                        0, 0, 0, 0, 0, 0, 0);
 
             // Clear all remaining state from this slot
@@ -1005,4 +1030,21 @@ int SdlInputHandler::getAttachedGamepadMask()
     }
 
     return mask;
+}
+
+void SdlInputHandler::raiseAllButtons()
+{
+    int mask = getAttachedGamepadMask();
+
+    if (m_MultiController) {
+        int numJoysticks = SDL_NumJoysticks();
+        for (int i = 0; i < numJoysticks; i++) {
+            if (SDL_IsGameController(i)) {
+                LiSendMultiControllerEvent(i, mask, 0, 0, 0, 0, 0, 0, 0);
+            }
+        }
+    }
+    else {
+        LiSendMultiControllerEvent(0, mask, 0, 0, 0, 0, 0, 0, 0);
+    }
 }

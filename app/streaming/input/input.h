@@ -132,6 +132,8 @@ public:
 
     int getAttachedGamepadMask();
 
+    void raiseAllButtons();
+
     void raiseAllKeys();
 
     void notifyMouseLeave();
@@ -145,6 +147,8 @@ public:
     bool isSystemKeyCaptureActive();
 
     void setCaptureActive(bool active);
+
+    void toggleMouseEmulation(SDL_JoystickID jsid);
 
     bool isMouseInVideoRegion(int mouseX, int mouseY, int windowWidth = -1, int windowHeight = -1);
 

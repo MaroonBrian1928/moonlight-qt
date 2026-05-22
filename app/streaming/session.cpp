@@ -3,8 +3,13 @@
 #include "streaming/streamutils.h"
 #include "backend/richpresencemanager.h"
 
+#include "imgui.h"
+#include "imgui_impl_sdl2.h"
+#include "imgui/devui.h"
+
 #include <Limelight.h>
 #include "SDL_compat.h"
+#include "path.h"
 #include "utils.h"
 
 #ifdef HAVE_FFMPEG
@@ -21,13 +26,6 @@
 #else
 #define ICON_SIZE 64
 #endif
-
-#define SDL_CODE_FLUSH_WINDOW_EVENT_BARRIER 100
-#define SDL_CODE_GAMECONTROLLER_RUMBLE 101
-#define SDL_CODE_GAMECONTROLLER_RUMBLE_TRIGGERS 102
-#define SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE 103
-#define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
-#define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
 
 #include <openssl/rand.h>
 
@@ -583,6 +581,9 @@ bool Session::initialize(QQuickWindow* qtWindow)
 {
     m_QtWindow = qtWindow;
 
+    // Pass initial settings to DevUI panel
+    DevUISettings::instance().InitFromPrefs(*m_Preferences);
+
 #ifdef Q_OS_DARWIN
     if (qEnvironmentVariableIntValue("I_WANT_BUGGY_FULLSCREEN") == 0) {
         // If we have a notch and the user specified one of the two native display modes
@@ -640,21 +641,13 @@ bool Session::initialize(QQuickWindow* qtWindow)
     getWindowDimensions(x, y, width, height);
 
     // Create a hidden window to use for decoder initialization tests
-    SDL_Window* testWindow = SDL_CreateWindow("", x, y, width, height,
-                                              SDL_WINDOW_HIDDEN | StreamUtils::getPlatformWindowFlags());
+    SDL_Window* testWindow = StreamUtils::createTestWindow();
     if (!testWindow) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Failed to create test window with platform flags: %s",
-                    SDL_GetError());
-
-        testWindow = SDL_CreateWindow("", x, y, width, height, SDL_WINDOW_HIDDEN);
-        if (!testWindow) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "Failed to create window for hardware decode test: %s",
-                         SDL_GetError());
-            SDL_QuitSubSystem(SDL_INIT_VIDEO);
-            return false;
-        }
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "Failed to create window for hardware decode test: %s",
+                     SDL_GetError());
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        return false;
     }
 
     qInfo() << "Server GPU:" << m_Computer->gpuModel;
@@ -665,6 +658,33 @@ bool Session::initialize(QQuickWindow* qtWindow)
 
     m_StreamConfig.fps = m_Preferences->fps;
     m_StreamConfig.bitrate = m_Preferences->bitrateKbps;
+
+    // get the precise refresh rate
+    m_StreamConfig.clientRefreshRateX100 = 0;
+    RefreshRateRational refreshRate = StreamUtils::getDisplayRefreshRateRational(testWindow);
+    if (refreshRate.valid) {
+        // choosing the lesser value should cover both common use cases: 60fps on 120hz, and 60fps on 59.94hz
+        int x100 = lround(refreshRate.hz * 100);
+        m_StreamConfig.clientRefreshRateX100 = SDL_min(m_StreamConfig.fps * 100, x100);
+        if (x100 % 2997 == 0) {
+            // Handle multiples of NTSC 29.97 e.g. 59.94, 119.88 paired with multiples of 30fps
+            if (m_StreamConfig.fps % 30 == 0) {
+                m_StreamConfig.clientRefreshRateX100 = 2997 * (m_StreamConfig.fps / 30);
+            }
+        }
+
+        // XXX request a slightly lower framerate (0.1%)
+        // m_StreamConfig.clientRefreshRateX100 -= lround(refreshRate.hz / 10.0);
+
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Set clientRefreshRateX100=%d for precise refresh rate %.2fHz (%d/%d)",
+                    m_StreamConfig.clientRefreshRateX100, refreshRate.hz,
+                    refreshRate.numerator, refreshRate.denominator);
+    }
+    else {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "Failed to set clientRefreshRateX100, could not determine precise refresh rate");
+    }
 
 #ifndef STEAM_LINK
     // Opt-in to all encryption features if we detect that the platform
@@ -1896,17 +1916,23 @@ void Session::exec()
     bool needsFirstEnterCapture = false;
     bool needsPostDecoderCreationCapture = false;
 
-    // HACK: For Wayland, we wait until we get the first SDL_WINDOWEVENT_ENTER
-    // event where it seems to work consistently on GNOME. For other platforms,
-    // especially where SDL may call SDL_RecreateWindow(), we must only capture
-    // after the decoder is created.
-    if (strcmp(SDL_GetCurrentVideoDriver(), "wayland") == 0) {
-        // Native Wayland: Capture on SDL_WINDOWEVENT_ENTER
-        needsFirstEnterCapture = true;
-    }
-    else {
-        // X11/XWayland: Capture after decoder creation
-        needsPostDecoderCreationCapture = true;
+    // Avoid capturing the mouse initially for windowed relative mode.
+    // We still capture in windowed absolute mode because it doesn't
+    // constrain the motion of the cursor. This allows the user to
+    // easily reposition or resize the window.
+    if (m_IsFullScreen || m_Preferences->absoluteMouseMode) {
+        // HACK: For Wayland, we wait until we get the first SDL_WINDOWEVENT_ENTER
+        // event where it seems to work consistently on GNOME. For other platforms,
+        // especially where SDL may call SDL_RecreateWindow(), we must only capture
+        // after the decoder is created.
+        if (strcmp(SDL_GetCurrentVideoDriver(), "wayland") == 0) {
+            // Native Wayland: Capture on SDL_WINDOWEVENT_ENTER
+            needsFirstEnterCapture = true;
+        }
+        else {
+            // X11/XWayland: Capture after decoder creation
+            needsPostDecoderCreationCapture = true;
+        }
     }
 
     // Stop text input. SDL enables it by default
@@ -1980,6 +2006,18 @@ void Session::exec()
             continue;
         }
 #endif
+
+#ifndef IMGUI_DISABLE
+        // let ImGui read keyboard/mouse events. If interacting with a UI element, we will check
+        // io.WantCaptureMouse and io.WantCaptureKeyboard below
+        if (ImGui::GetCurrentContext()) {
+            ImGuiIO& io = ImGui::GetIO();
+            if (io.BackendPlatformUserData != nullptr) {
+                ImGui_ImplSDL2_ProcessEvent(&event);
+            }
+        }
+#endif
+
         switch (event.type) {
         case SDL_QUIT:
             SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -2020,6 +2058,9 @@ void Session::exec()
             case SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS:
                 m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
                                                     (DualSenseOutputReport *)event.user.data2);
+                break;
+            case SDL_CODE_TOGGLE_FULLSCREEN:
+                toggleFullscreen();
                 break;
             default:
                 SDL_assert(false);
@@ -2360,4 +2401,11 @@ DispatchDeferredCleanup:
     // When it is complete, it will release our s_ActiveSessionSemaphore
     // reference.
     QThreadPool::globalInstance()->start(new DeferredSessionCleanupTask(this));
+}
+
+void Session::toggleMouseEmulation(SDL_JoystickID jsid)
+{
+    if (m_InputHandler != nullptr) {
+        m_InputHandler->toggleMouseEmulation(jsid);
+    }
 }

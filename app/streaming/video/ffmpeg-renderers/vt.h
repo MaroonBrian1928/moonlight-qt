@@ -18,7 +18,8 @@ protected:
     CFDataRef m_MasteringDisplayColorVolume;
     CFDataRef m_ContentLightLevelInfo;
 };
-#endif
+
+#endif // __OBJC__
 
 // A factory is required to avoid pulling in
 // incompatible Objective-C headers.

@@ -449,6 +449,14 @@ int main(int argc, char *argv[])
         qputenv("QML_DISK_CACHE_PATH", Path::getQmlCacheDir().toUtf8());
     }
 
+#ifdef Q_OS_DARWIN
+    // The HUD only responds to this env var and it must be defined prior to using Metal
+    // I can't find a way to enable it only for SDL, but a hacky workaround is to set opacity to 0%.
+    qputenv("MTL_HUD_ENABLED", "1");
+    qputenv("MTL_HUD_DISABLE_MENU_BAR", "1");
+    qputenv("MTL_HUD_OPACITY", "0.0");
+#endif
+
 #ifdef Q_OS_WIN32
     // Grab the original std handles before we potentially redirect them later
     HANDLE oldConOut = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -607,7 +615,7 @@ int main(int argc, char *argv[])
     }
 #endif
 
-#ifdef Q_OS_MACOS
+#ifdef Q_OS_DARWIN
     // This avoids using the default keychain for SSL, which may cause
     // password prompts on macOS.
     qputenv("QT_SSL_USE_TEMPORARY_KEYCHAIN", "1");
@@ -637,7 +645,9 @@ int main(int argc, char *argv[])
 #if defined(Q_OS_DARWIN) && defined(QT_DEBUG)
     // Enable Metal valiation for debug builds
     qputenv("MTL_DEBUG_LAYER", "1");
+    qputenv("MTL_DEBUG_LAYER_ERROR_MODE", "assert");
     qputenv("MTL_SHADER_VALIDATION", "1");
+    qputenv("MTL_DEBUG_LAYER_VALIDATE_UNRETAINED_RESOURCES", "5");
 #endif
 
     // We don't want system proxies to apply to us
@@ -738,6 +748,19 @@ int main(int argc, char *argv[])
     // use this functionality and it can cause hangs when querying broken devices.
     SDL_SetHint("SDL_WINDOWS_DETECT_DEVICE_HOTPLUG", "0");
 
+    // SDL3 supports offloading scaling to the Wayland compositor, which we take
+    // advantage of in the GL_IS_SLOW case to help fillrate-limited GPUs. To stay
+    // consistent with our own scaling logic, we need aspect ratio scaling which
+    // KDE doesn't currently handle properly. As a compromise, we'll just enable
+    // aspect ratio scaling in non-KDE environments.
+    //
+    // NB: We do not force SDL_VIDEO_WAYLAND_MODE_SCALING to "stretch" on KDE,
+    // because SDL 3.6 has a workaround for KDE and switches the default to
+    // "aspect" for all desktops.
+    if (qgetenv("XDG_CURRENT_DESKTOP") != "KDE") {
+        SDL_SetHint("SDL_VIDEO_WAYLAND_MODE_SCALING", "aspect");
+    }
+
     QGuiApplication app(argc, argv);
 
 #ifdef Q_OS_UNIX
@@ -800,6 +823,36 @@ int main(int argc, char *argv[])
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "Running with SDL %d.%d.%d",
                 runtimeVersion.major, runtimeVersion.minor, runtimeVersion.patch);
+
+    // If we're running under sdl2-compat, it may tell us the underlying SDL3 version
+    const char* sdl3Version = SDL_GetHint("SDL3_VERSION");
+    int sdl3VersionInt = 0;
+    if (sdl3Version) {
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "SDL3 version: %s",
+                    sdl3Version);
+
+        // Parse the version into integer form
+        QStringList list = QString(sdl3Version).split('.');
+        Q_ASSERT(list.size() == 3);
+        if (list.size() == 3) {
+            sdl3VersionInt = SDL_VERSIONNUM(list.at(0).toInt(), list.at(1).toInt(), list.at(2).toInt());
+        }
+    }
+
+    // SDL 3.4.0 and 3.4.2 have bugs in atomic KMSDRM support that break us,
+    // so disable atomic on the affected SDL3 versions. Since not all versions
+    // of sdl2-compat will set the SDL3_VERSION hint, we assume that versions
+    // prior to 2.32.66 are affected (since that was released at the same time
+    // as SDL 3.4.4 with the atomic fixes).
+    if ((sdl3VersionInt != 0 && sdl3VersionInt < SDL_VERSIONNUM(3, 4, 4)) ||
+            (runtimeVersion.patch >= 50 && runtimeVersion.patch < 66)) {
+#if !defined(Q_OS_WIN32) && !defined(Q_OS_DARWIN)
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Setting SDL_KMSDRM_ATOMIC=0 for older sdl2-compat/SDL3 version");
+        SDL_SetHint("SDL_KMSDRM_ATOMIC", "0");
+#endif
+    }
 
     // Apply the initial translation based on user preference
     StreamingPreferences::get()->retranslate();

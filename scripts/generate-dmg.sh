@@ -31,6 +31,9 @@ fi
 
 [ "$SIGNING_IDENTITY" == "" ] || git diff-index --quiet HEAD -- || fail "Signed release builds must not have unstaged changes!"
 
+echo Updating dependencies
+python3 $SOURCE_ROOT/setup-deps.py
+
 echo Cleaning output directories
 rm -rf $BUILD_FOLDER
 rm -rf $INSTALLER_FOLDER
@@ -40,7 +43,11 @@ mkdir $INSTALLER_FOLDER
 
 echo Configuring the project
 pushd $BUILD_FOLDER
-qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" || fail "Qmake failed!"
+if command -v ccache >/dev/null 2>&1; then
+  qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" QMAKE_CC="ccache clang" QMAKE_CXX="ccache clang++" QMAKE_OBJECTIVE_CC="ccache clang++" || fail "Qmake failed!"
+else
+  qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" || fail "Qmake failed!"
+fi
 popd
 
 echo Compiling Moonlight in $BUILD_CONFIG configuration
@@ -64,15 +71,26 @@ echo Removing dSYM files from app bundle
 find $BUILD_FOLDER/app/Moonlight.app/ -name '*.dSYM' | xargs rm -rf
 
 if [ "$SIGNING_IDENTITY" != "" ]; then
+  if [ "$MOONLIGHT_PROVISION_PROFILE" == "" ]; then
+    fail "Please set MOONLIGHT_PROVISION_PROFILE to the path to your .provisionprofile"
+  fi
+  cp $SOURCE_ROOT/app/deploy/macos/spatial-audio.entitlements $BUILD_FOLDER/app/Moonlight.app/Contents/Resources/spatial-audio.entitlements
+  cp $MOONLIGHT_PROVISION_PROFILE $BUILD_FOLDER/app/Moonlight.app/Contents/embedded.provisionprofile
+
   echo Signing app bundle
-  codesign --force --deep --options runtime --timestamp --sign "$SIGNING_IDENTITY" $BUILD_FOLDER/app/Moonlight.app || fail "Signing failed!"
+  codesign --force --deep --force --verify --verbose --options runtime --timestamp \
+    --entitlements $BUILD_FOLDER/app/Moonlight.app/Contents/Resources/spatial-audio.entitlements \
+    --sign "$SIGNING_IDENTITY" \
+    $BUILD_FOLDER/app/Moonlight.app || fail "Signing failed!"
+  echo "App signature:"
+  codesign -d --entitlements - -vvv $BUILD_FOLDER/app/Moonlight.app
 fi
 
 echo Creating DMG
 if [ "$SIGNING_IDENTITY" != "" ]; then
   create-dmg $BUILD_FOLDER/app/Moonlight.app $INSTALLER_FOLDER --identity="$SIGNING_IDENTITY" --no-version-in-filename || fail "create-dmg failed!"
 else
-  create-dmg $BUILD_FOLDER/app/Moonlight.app $INSTALLER_FOLDER --no-version-in-filename
+  create-dmg $BUILD_FOLDER/app/Moonlight.app $INSTALLER_FOLDER --no-code-sign --no-version-in-filename
   case $? in
     0) ;;
     2) ;;

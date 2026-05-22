@@ -22,33 +22,41 @@ public:
     // sources require calls to waitForVsync().
     virtual bool isAsync() = 0;
 
+    // Optional method called before destruction
+    virtual void stop() = 0;
+
+    // Call this method after receiving m_VsyncSignalled or after
+    // waitForVsync() returns to obtain the remaining time in the current
+    // vblank interval. A negative value means the interval was missed.
+    virtual double remainingMilliseconds() = 0;
+
     virtual void waitForVsync() {
         // Synchronous sources must implement waitForVsync()!
         SDL_assert(false);
     }
 };
 
-class Pacer
+class Pacer : public IFramePacer
 {
 public:
     Pacer(IFFmpegRenderer* renderer, PVIDEO_STATS videoStats);
 
-    ~Pacer();
+    virtual ~Pacer();
 
-    void submitFrame(AVFrame* frame);
+    virtual void submitFrame(AVFrame* frame) override;
 
-    bool initialize(SDL_Window* window, int maxVideoFps, bool enablePacing);
+    virtual bool initialize(IFFmpegRenderer* renderer, PDECODER_PARAMETERS params) override;
 
-    void signalVsync();
+    virtual void signalVsync() override;
 
-    void renderOnMainThread();
+    virtual bool renderOnMainThread() override;
 
 private:
     static int vsyncThread(void* context);
 
     static int renderThread(void* context);
 
-    void handleVsync(int timeUntilNextVsyncMillis);
+    void handleVsync(double timeUntilNextVsyncMillis);
 
     void enqueueFrameForRenderingAndUnlock(AVFrame* frame);
 
@@ -70,7 +78,7 @@ private:
     bool m_Stopping;
 
     IVsyncSource* m_VsyncSource;
-    IFFmpegRenderer* m_VsyncRenderer;
+    IFFmpegRenderer* m_Renderer;
     int m_MaxVideoFps;
     int m_DisplayFps;
     PVIDEO_STATS m_VideoStats;

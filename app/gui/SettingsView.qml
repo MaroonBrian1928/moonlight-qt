@@ -42,6 +42,24 @@ Flickable {
         duration: 100
     }
 
+    function commitAudioThresholdSettings() {
+        if (audioPlaybackThresholdField.acceptableInput) {
+            StreamingPreferences.audioPlaybackThresholdMs = parseInt(audioPlaybackThresholdField.text)
+            audioPlaybackThresholdField.text = StreamingPreferences.audioPlaybackThresholdMs.toString()
+        }
+        else {
+            audioPlaybackThresholdField.text = StreamingPreferences.audioPlaybackThresholdMs.toString()
+        }
+
+        if (audioDropThresholdField.acceptableInput) {
+            StreamingPreferences.audioDropThresholdMs = parseInt(audioDropThresholdField.text)
+            audioDropThresholdField.text = StreamingPreferences.audioDropThresholdMs.toString()
+        }
+        else {
+            audioDropThresholdField.text = StreamingPreferences.audioDropThresholdMs.toString()
+        }
+    }
+
     Window.onActiveFocusItemChanged: {
         var item = Window.activeFocusItem
         if (item) {
@@ -84,12 +102,14 @@ Flickable {
         SdlGamepadKeyNavigation.setUiNavMode(false)
 
         // Save the prefs so the Session can observe the changes
+        commitAudioThresholdSettings()
         StreamingPreferences.save()
     }
 
     Component.onDestruction: {
         // Also save preferences on destruction, since we won't get a
         // deactivating callback if the user just closes Moonlight
+        commitAudioThresholdSettings()
         StreamingPreferences.save()
     }
 
@@ -726,125 +746,11 @@ Flickable {
                     }
                 }
 
-                Label {
+                RendererDisplayModeSection {
                     width: parent.width
-                    id: windowModeTitle
-                    text: qsTr("Display mode")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                    visible: SystemProperties.hasDesktopEnvironment
+                    languageChangedSignal: settingsPage.languageChanged
                 }
 
-                AutoResizingComboBox {
-                    function createModel() {
-                        var model = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', parent, '')
-
-                        model.append({
-                                         text: qsTr("Fullscreen"),
-                                         val: StreamingPreferences.WM_FULLSCREEN
-                                     })
-
-                        model.append({
-                                         text: qsTr("Borderless windowed"),
-                                         val: StreamingPreferences.WM_FULLSCREEN_DESKTOP
-                                     })
-
-                        model.append({
-                                         text: qsTr("Windowed"),
-                                         val: StreamingPreferences.WM_WINDOWED
-                                     })
-
-
-                        // Set the recommended option based on the OS
-                        for (var i = 0; i < model.count; i++) {
-                            var thisWm = model.get(i).val;
-                            if (thisWm === StreamingPreferences.recommendedFullScreenMode) {
-                                model.get(i).text += " " + qsTr("(Recommended)")
-                                model.move(i, 0, 1)
-                                break
-                            }
-                        }
-
-                        return model
-                    }
-
-
-                    // This is used on initialization and upon retranslation
-                    function reinitialize() {
-                        if (!visible) {
-                            // Do nothing if the control won't even be visible
-                            return
-                        }
-
-                        model = createModel()
-                        currentIndex = 0
-
-                        // Set the current value based on the saved preferences
-                        var savedWm = StreamingPreferences.windowMode
-                        for (var i = 0; i < model.count; i++) {
-                             var thisWm = model.get(i).val;
-                             if (savedWm === thisWm) {
-                                 currentIndex = i
-                                 break
-                             }
-                        }
-
-                        activated(currentIndex)
-                    }
-
-                    Component.onCompleted: {
-                        reinitialize()
-                        languageChanged.connect(reinitialize)
-                    }
-
-                    id: windowModeComboBox
-                    visible: SystemProperties.hasDesktopEnvironment
-                    enabled: !SystemProperties.rendererAlwaysFullScreen
-                    hoverEnabled: true
-                    textRole: "text"
-                    onActivated: {
-                        StreamingPreferences.windowMode = model.get(currentIndex).val
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Fullscreen generally provides the best performance, but borderless windowed may work better with features like macOS Spaces, Alt+Tab, screenshot tools, on-screen overlays, etc.")
-                }
-
-                CheckBox {
-                    id: vsyncCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("V-Sync")
-                    font.pointSize:  12
-                    checked: StreamingPreferences.enableVsync
-                    onCheckedChanged: {
-                        StreamingPreferences.enableVsync = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Disabling V-Sync allows sub-frame rendering latency, but it can display visible tearing")
-                }
-
-                CheckBox {
-                    id: framePacingCheck
-                    width: parent.width
-                    hoverEnabled: true
-                    text: qsTr("Frame pacing")
-                    font.pointSize:  12
-                    enabled: StreamingPreferences.enableVsync
-                    checked: StreamingPreferences.enableVsync && StreamingPreferences.framePacing
-                    onCheckedChanged: {
-                        StreamingPreferences.framePacing = checked
-                    }
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Frame pacing reduces micro-stutter by delaying frames that come in too early")
-                }
             }
         }
 
@@ -860,52 +766,174 @@ Flickable {
                 anchors.fill: parent
                 spacing: 5
 
+                Row {
+                    width: parent.width
+                    spacing: 20
+
+                    Column {
+                        width: (parent.width - parent.spacing) * 0.5
+                        spacing: 5
+
+                        Label {
+                            id: resAudioTitle
+                            text: qsTr("Audio configuration")
+                            font.pointSize: 12
+                            wrapMode: Text.Wrap
+                        }
+
+                        AutoResizingComboBox {
+                            id: audioComboBox
+                            width: parent.width
+                            textRole: "text"
+                            Component.onCompleted: {
+                                var saved_audio = StreamingPreferences.audioConfig
+                                currentIndex = 0
+                                for (var i = 0; i < audioListModel.count; i++) {
+                                    var el_audio = audioListModel.get(i).val;
+                                    if (saved_audio === el_audio) {
+                                        currentIndex = i
+                                        break
+                                    }
+                                }
+                                activated(currentIndex)
+                            }
+
+                            model: ListModel {
+                                id: audioListModel
+                                ListElement {
+                                    text: qsTr("Stereo")
+                                    val: StreamingPreferences.AC_STEREO
+                                }
+
+                                ListElement {
+                                    text: qsTr("5.1 surround sound")
+                                    val: StreamingPreferences.AC_51_SURROUND
+                                }
+
+                                ListElement {
+                                    text: qsTr("7.1 surround sound")
+                                    val: StreamingPreferences.AC_71_SURROUND
+                                }
+                            }
+
+                            onActivated: {
+                                StreamingPreferences.audioConfig = audioListModel.get(currentIndex).val
+                            }
+                        }
+                    }
+
+                    Column {
+                        width: (parent.width - parent.spacing) * 0.5
+                        spacing: 5
+                        visible: Qt.platform.os == "osx"
+
+                        Label {
+                            id: resSpatialAudioTitle
+                            text: qsTr("Spatial audio")
+                            font.pointSize: 12
+                            wrapMode: Text.Wrap
+                        }
+
+                        Row {
+                            spacing: 12
+                            width: parent.width
+
+                            AutoResizingComboBox {
+                                id: spatialAudioComboBox
+                                enabled: StreamingPreferences.audioConfig != StreamingPreferences.AC_STEREO
+                                textRole: "text"
+                                Component.onCompleted: {
+                                    var saved_sac = StreamingPreferences.spatialAudioConfig
+                                    currentIndex = 0
+                                    for (var i = 0; i < spatialAudioListModel.count; i++) {
+                                        var el_audio = spatialAudioListModel.get(i).val
+
+                                        if (saved_sac === el_audio) {
+                                            currentIndex = i
+                                            break
+                                        }
+                                    }
+                                    activated(currentIndex)
+                                }
+
+                                model: ListModel {
+                                    id: spatialAudioListModel
+                                    ListElement {
+                                        text: qsTr("Fixed Spatial")
+                                        val: StreamingPreferences.SAC_FIXED
+                                    }
+                                    ListElement {
+                                        text: qsTr("Head-tracked Spatial")
+                                        val: StreamingPreferences.SAC_HEAD_TRACKED
+                                    }
+                                    ListElement {
+                                        text: qsTr("Disabled")
+                                        val: StreamingPreferences.SAC_DISABLED
+                                    }
+                                }
+
+                                onActivated: {
+                                    StreamingPreferences.spatialAudioConfig = spatialAudioListModel.get(currentIndex).val
+                                }
+
+                                ToolTip.delay: 1000
+                                ToolTip.timeout: -1
+                                ToolTip.visible: hovered
+                                ToolTip.text: qsTr("Spatial audio will be used when using any type of headphones, built-in Macbook speakers, and 2-channel USB devices.")
+                            }
+                        }
+                    }
+                }
+
                 Label {
                     width: parent.width
-                    id: resAudioTitle
-                    text: qsTr("Audio configuration")
+                    text: qsTr("SDL audio: queued audio before playback starts or resumes (ms)")
                     font.pointSize: 12
                     wrapMode: Text.Wrap
                 }
 
-                AutoResizingComboBox {
-                    // ignore setting the index at first, and actually set it when the component is loaded
-                    Component.onCompleted: {
-                        var saved_audio = StreamingPreferences.audioConfig
-                        currentIndex = 0
-                        for (var i = 0; i < audioListModel.count; i++) {
-                            var el_audio = audioListModel.get(i).val;
-                            if (saved_audio === el_audio) {
-                                currentIndex = i
-                                break
-                            }
-                        }
-                        activated(currentIndex)
+                TextField {
+                    id: audioPlaybackThresholdField
+                    width: Math.min(parent.width, 120)
+                    text: StreamingPreferences.audioPlaybackThresholdMs.toString()
+                    maximumLength: 4
+                    inputMethodHints: Qt.ImhDigitsOnly
+                    validator: IntValidator { bottom: 0; top: 1000 }
+
+                    onEditingFinished: {
+                        commitAudioThresholdSettings()
                     }
 
-                    id: audioComboBox
-                    textRole: "text"
-                    model: ListModel {
-                        id: audioListModel
-                        ListElement {
-                            text: qsTr("Stereo")
-                            val: StreamingPreferences.AC_STEREO
-                        }
-                        ListElement {
-                            text: qsTr("5.1 surround sound")
-                            val: StreamingPreferences.AC_51_SURROUND
-                        }
-                        ListElement {
-                            text: qsTr("7.1 surround sound")
-                            val: StreamingPreferences.AC_71_SURROUND
-                        }
-                    }
-                    // ::onActivated must be used, as it only listens for when the index is changed by a human
-                    onActivated : {
-                        StreamingPreferences.audioConfig = audioListModel.get(currentIndex).val
-                    }
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("SDL audio only. Default: 0 ms. Set this above 0 if you want Moonlight to wait for buffered SDL audio before starting playback or resuming after an underrun.")
                 }
 
+                Label {
+                    width: parent.width
+                    text: qsTr("SDL audio: maximum queued audio in Moonlight's buffer (ms)")
+                    font.pointSize: 12
+                    wrapMode: Text.Wrap
+                }
+
+                TextField {
+                    id: audioDropThresholdField
+                    width: Math.min(parent.width, 120)
+                    text: StreamingPreferences.audioDropThresholdMs.toString()
+                    maximumLength: 4
+                    inputMethodHints: Qt.ImhDigitsOnly
+                    validator: IntValidator { bottom: 1; top: 1000 }
+
+                    onEditingFinished: {
+                        commitAudioThresholdSettings()
+                    }
+
+                    ToolTip.delay: 1000
+                    ToolTip.timeout: 5000
+                    ToolTip.visible: hovered
+                    ToolTip.text: qsTr("SDL audio only. Default: 30 ms. Increase this if you want Moonlight to tolerate more queued audio before dropping new samples.")
+                }
 
                 CheckBox {
                     id: audioPcCheck
@@ -1097,10 +1125,10 @@ Flickable {
                             text: "Português" // Portuguese
                             val: StreamingPreferences.LANG_PT
                         }
-                        /* ListElement {
+                        ListElement {
                             text: "Português do Brasil" // Brazilian Portuguese
                             val: StreamingPreferences.LANG_PT_BR
-                        } */
+                        }
                         ListElement {
                             text: "Ελληνικά" // Greek
                             val: StreamingPreferences.LANG_EL
@@ -1213,7 +1241,7 @@ Flickable {
                         ListElement {
                             text: qsTr("Maximized")
                             val: StreamingPreferences.UI_MAXIMIZED
-                        }   
+                        }
                         ListElement {
                             text: qsTr("Fullscreen")
                             val: StreamingPreferences.UI_FULLSCREEN
@@ -1732,24 +1760,6 @@ Flickable {
                     onCheckedChanged: {
                         StreamingPreferences.detectNetworkBlocking = checked
                     }
-                }
-
-                CheckBox {
-                    id: showPerformanceOverlay
-                    width: parent.width
-                    text: qsTr("Show performance stats while streaming")
-                    font.pointSize: 12
-                    checked: StreamingPreferences.showPerformanceOverlay
-                    onCheckedChanged: {
-                        StreamingPreferences.showPerformanceOverlay = checked
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("Display real-time stream performance information while streaming.") + "\n\n" +
-                                  qsTr("You can toggle it at any time while streaming using Ctrl+Alt+Shift+S or Select+L1+R1+X.") + "\n\n" +
-                                  qsTr("The performance overlay is not supported on Steam Link or Raspberry Pi.")
                 }
             }
         }

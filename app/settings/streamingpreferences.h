@@ -26,6 +26,14 @@ public:
     };
     Q_ENUM(AudioConfig)
 
+    enum SpatialAudioConfig
+    {
+        SAC_FIXED,
+        SAC_HEAD_TRACKED,
+        SAC_DISABLED
+    };
+    Q_ENUM(SpatialAudioConfig)
+
     enum VideoCodecConfig
     {
         VCC_AUTO,
@@ -108,6 +116,29 @@ public:
     };
     Q_ENUM(CaptureSysKeysMode);
 
+    enum Renderer
+    {
+        RENDERER_VT_METAL = 0,
+        RENDERER_AVSAMPLEBUFFER = 1,
+    };
+    Q_ENUM(Renderer)
+
+    enum FramePacingMode
+    {
+        FRAME_PACING_IMMEDIATE = 0,
+        FRAME_PACING_DISPLAY_LOCKED = 1,
+    };
+    Q_ENUM(FramePacingMode)
+
+    enum PresentMode
+    {
+        PRESENT_AUTO = 0,
+        PRESENT_FIXED = 1,
+        PRESENT_VRR = 2,
+        PRESENT_NO_VSYNC = 3,
+    };
+    Q_ENUM(PresentMode)
+
     Q_PROPERTY(int width MEMBER width NOTIFY displayModeChanged)
     Q_PROPERTY(int height MEMBER height NOTIFY displayModeChanged)
     Q_PROPERTY(int fps MEMBER fps NOTIFY displayModeChanged)
@@ -130,6 +161,7 @@ public:
     Q_PROPERTY(bool detectNetworkBlocking MEMBER detectNetworkBlocking NOTIFY detectNetworkBlockingChanged)
     Q_PROPERTY(bool showPerformanceOverlay MEMBER showPerformanceOverlay NOTIFY showPerformanceOverlayChanged)
     Q_PROPERTY(AudioConfig audioConfig MEMBER audioConfig NOTIFY audioConfigChanged)
+    Q_PROPERTY(SpatialAudioConfig spatialAudioConfig MEMBER spatialAudioConfig NOTIFY spatialAudioConfigChanged)
     Q_PROPERTY(VideoCodecConfig videoCodecConfig MEMBER videoCodecConfig NOTIFY videoCodecConfigChanged)
     Q_PROPERTY(bool enableHdr MEMBER enableHdr NOTIFY enableHdrChanged)
     Q_PROPERTY(bool enableYUV444 MEMBER enableYUV444 NOTIFY enableYUV444Changed)
@@ -143,8 +175,15 @@ public:
     Q_PROPERTY(bool reverseScrollDirection MEMBER reverseScrollDirection NOTIFY reverseScrollDirectionChanged)
     Q_PROPERTY(bool swapFaceButtons MEMBER swapFaceButtons NOTIFY swapFaceButtonsChanged)
     Q_PROPERTY(bool keepAwake MEMBER keepAwake NOTIFY keepAwakeChanged)
+    Q_PROPERTY(int audioPlaybackThresholdMs MEMBER audioPlaybackThresholdMs NOTIFY audioPlaybackThresholdMsChanged)
+    Q_PROPERTY(int audioDropThresholdMs MEMBER audioDropThresholdMs NOTIFY audioDropThresholdMsChanged)
     Q_PROPERTY(CaptureSysKeysMode captureSysKeysMode MEMBER captureSysKeysMode NOTIFY captureSysKeysModeChanged)
-    Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged);
+    Q_PROPERTY(Language language MEMBER language NOTIFY languageChanged)
+    Q_PROPERTY(Renderer renderer MEMBER renderer NOTIFY rendererChanged)
+    Q_PROPERTY(FramePacingMode framePacingMode MEMBER framePacingMode NOTIFY framePacingModeChanged)
+    Q_PROPERTY(PresentMode presentMode MEMBER presentMode NOTIFY presentModeChanged)
+    Q_PROPERTY(bool showPerformanceGraphs MEMBER showPerformanceGraphs NOTIFY showPerformanceGraphsChanged)
+    Q_PROPERTY(int vtMetalFramesInFlight MEMBER vtMetalFramesInFlight NOTIFY vtMetalFramesInFlightChanged)
 
     Q_INVOKABLE bool retranslate();
 
@@ -176,8 +215,11 @@ public:
     bool reverseScrollDirection;
     bool swapFaceButtons;
     bool keepAwake;
+    int audioPlaybackThresholdMs;
+    int audioDropThresholdMs;
     int packetSize;
     AudioConfig audioConfig;
+    SpatialAudioConfig spatialAudioConfig;
     VideoCodecConfig videoCodecConfig;
     bool enableHdr;
     bool enableYUV444;
@@ -187,6 +229,11 @@ public:
     UIDisplayMode uiDisplayMode;
     Language language;
     CaptureSysKeysMode captureSysKeysMode;
+    Renderer renderer;
+    FramePacingMode framePacingMode;
+    PresentMode presentMode;
+    bool showPerformanceGraphs;
+    int vtMetalFramesInFlight;
 
 signals:
     void displayModeChanged();
@@ -203,6 +250,7 @@ signals:
     void absoluteMouseModeChanged();
     void absoluteTouchModeChanged();
     void audioConfigChanged();
+    void spatialAudioConfigChanged();
     void videoCodecConfigChanged();
     void enableHdrChanged();
     void enableYUV444Changed();
@@ -223,7 +271,14 @@ signals:
     void swapFaceButtonsChanged();
     void captureSysKeysModeChanged();
     void keepAwakeChanged();
+    void audioPlaybackThresholdMsChanged();
+    void audioDropThresholdMsChanged();
     void languageChanged();
+    void rendererChanged();
+    void framePacingModeChanged();
+    void presentModeChanged();
+    void showPerformanceGraphsChanged();
+    void vtMetalFramesInFlightChanged();
 
 private:
     explicit StreamingPreferences(QQmlEngine *qmlEngine);
@@ -232,4 +287,3 @@ private:
 
     QQmlEngine* m_QmlEngine;
 };
-

@@ -5,6 +5,10 @@
 #include "renderers/slaud.h"
 #endif
 
+#ifdef HAVE_COREAUDIO
+#include "renderers/coreaudio/coreaudio.h"
+#endif
+
 #include "renderers/sdl.h"
 
 #include <Limelight.h>
@@ -17,14 +21,28 @@
     delete __renderer;                                 \
 }
 
+#define TRY_INIT_RENDERER_ARGS(renderer, opusConfig, ...) \
+{                                                         \
+    IAudioRenderer* __renderer = new renderer(__VA_ARGS__); \
+    if (__renderer->prepareForPlayback(opusConfig))       \
+        return __renderer;                                \
+    delete __renderer;                                    \
+}
+
 IAudioRenderer* Session::createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATION opusConfig)
 {
     // Handle explicit ML_AUDIO setting and fail if the requested backend fails
     QString mlAudio = qgetenv("ML_AUDIO").toLower();
     if (mlAudio == "sdl") {
-        TRY_INIT_RENDERER(SdlAudioRenderer, opusConfig)
+        TRY_INIT_RENDERER_ARGS(SdlAudioRenderer, opusConfig, m_Preferences->audioPlaybackThresholdMs, m_Preferences->audioDropThresholdMs)
         return nullptr;
     }
+#ifdef HAVE_COREAUDIO
+    else if (mlAudio == "coreaudio") {
+        TRY_INIT_RENDERER(CoreAudioRenderer, opusConfig)
+        return nullptr;
+    }
+#endif
 #if defined(HAVE_SLAUDIO)
     else if (mlAudio == "slaudio") {
         TRY_INIT_RENDERER(SLAudioRenderer, opusConfig)
@@ -45,8 +63,13 @@ IAudioRenderer* Session::createAudioRenderer(const POPUS_MULTISTREAM_CONFIGURATI
     TRY_INIT_RENDERER(SLAudioRenderer, opusConfig)
 #endif
 
+#ifdef HAVE_COREAUDIO
+    // Native renderer for macOS/iOS/tvOS, suports spatial audio
+    TRY_INIT_RENDERER(CoreAudioRenderer, opusConfig)
+#endif
+
     // Default to SDL
-    TRY_INIT_RENDERER(SdlAudioRenderer, opusConfig)
+    TRY_INIT_RENDERER_ARGS(SdlAudioRenderer, opusConfig, m_Preferences->audioPlaybackThresholdMs, m_Preferences->audioDropThresholdMs)
 
     return nullptr;
 }
