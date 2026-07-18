@@ -32,6 +32,11 @@ mkdir $BUILD_FOLDER
 mkdir $DEPLOY_FOLDER
 mkdir $INSTALLER_FOLDER
 
+# Enable LTO for official builds
+export CFLAGS=-flto=auto
+export CXXFLAGS=-flto=auto
+export LDFLAGS=-flto=auto
+
 echo Configuring the project
 pushd $BUILD_FOLDER
 # Building with Wayland support will cause linuxdeploy to include libwayland-client.so in the AppImage.
@@ -41,7 +46,7 @@ pushd $BUILD_FOLDER
 # work even in X11. To avoid this, we will disable Wayland support for the AppImage.
 #
 # We disable DRM support because linuxdeploy doesn't bundle the appropriate libraries for Qt EGLFS.
-qmake6 $SOURCE_ROOT/moonlight-qt.pro CONFIG+=disable-wayland CONFIG+=disable-libdrm PREFIX=$DEPLOY_FOLDER/usr DEFINES+=APP_IMAGE || fail "Qmake failed!"
+qmake6 $SOURCE_ROOT/moonlight-qt.pro CONFIG+=disable-wayland CONFIG+=disable-libdrm PREFIX=$DEPLOY_FOLDER/usr DEFINES+=APP_IMAGE $EXTRA_QMAKE_FLAGS || fail "Qmake failed!"
 popd
 
 echo Compiling Moonlight in $BUILD_CONFIG configuration
@@ -57,10 +62,16 @@ popd
 export QML_SOURCES_PATHS=$SOURCE_ROOT/app/gui
 export QMAKE=qmake6
 
+EXTRA_DEPLOY_ARGS=
+if [ -e "$SOURCE_ROOT/pyrowave/build/libpyrowave-shared.so.0" ]; then
+  EXTRA_DEPLOY_ARGS="--library=$SOURCE_ROOT/pyrowave/build/libpyrowave-shared.so.0"
+fi
+
 echo Creating AppImage
 pushd $INSTALLER_FOLDER
 VERSION=$VERSION $LINUXDEPLOY --appdir $DEPLOY_FOLDER \
   --library=/usr/local/lib/libSDL3.so.0 \
+  $EXTRA_DEPLOY_ARGS \
   --plugin qt --output appimage || fail "linuxdeploy failed!"
 popd
 

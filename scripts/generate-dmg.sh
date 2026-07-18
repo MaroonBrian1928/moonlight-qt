@@ -41,6 +41,11 @@ mkdir $BUILD_ROOT
 mkdir $BUILD_FOLDER
 mkdir $INSTALLER_FOLDER
 
+# Enable LTO for official builds
+export CFLAGS=-flto=thin
+export CXXFLAGS=-flto=thin
+export LDFLAGS=-flto=thin
+
 echo Configuring the project
 pushd $BUILD_FOLDER
 if command -v ccache >/dev/null 2>&1; then

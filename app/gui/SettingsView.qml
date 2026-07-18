@@ -42,24 +42,6 @@ Flickable {
         duration: 100
     }
 
-    function commitAudioThresholdSettings() {
-        if (audioPlaybackThresholdField.acceptableInput) {
-            StreamingPreferences.audioPlaybackThresholdMs = parseInt(audioPlaybackThresholdField.text)
-            audioPlaybackThresholdField.text = StreamingPreferences.audioPlaybackThresholdMs.toString()
-        }
-        else {
-            audioPlaybackThresholdField.text = StreamingPreferences.audioPlaybackThresholdMs.toString()
-        }
-
-        if (audioDropThresholdField.acceptableInput) {
-            StreamingPreferences.audioDropThresholdMs = parseInt(audioDropThresholdField.text)
-            audioDropThresholdField.text = StreamingPreferences.audioDropThresholdMs.toString()
-        }
-        else {
-            audioDropThresholdField.text = StreamingPreferences.audioDropThresholdMs.toString()
-        }
-    }
-
     Window.onActiveFocusItemChanged: {
         var item = Window.activeFocusItem
         if (item) {
@@ -102,14 +84,12 @@ Flickable {
         SdlGamepadKeyNavigation.setUiNavMode(false)
 
         // Save the prefs so the Session can observe the changes
-        commitAudioThresholdSettings()
         StreamingPreferences.save()
     }
 
     Component.onDestruction: {
         // Also save preferences on destruction, since we won't get a
         // deactivating callback if the user just closes Moonlight
-        commitAudioThresholdSettings()
         StreamingPreferences.save()
     }
 
@@ -951,56 +931,6 @@ Flickable {
                     }
                 }
 
-                Label {
-                    width: parent.width
-                    text: qsTr("SDL audio: queued audio before playback starts or resumes (ms)")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                TextField {
-                    id: audioPlaybackThresholdField
-                    width: Math.min(parent.width, 120)
-                    text: StreamingPreferences.audioPlaybackThresholdMs.toString()
-                    maximumLength: 4
-                    inputMethodHints: Qt.ImhDigitsOnly
-                    validator: IntValidator { bottom: 0; top: 1000 }
-
-                    onEditingFinished: {
-                        commitAudioThresholdSettings()
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("SDL audio only. Default: 0 ms. Set this above 0 if you want Moonlight to wait for buffered SDL audio before starting playback or resuming after an underrun.")
-                }
-
-                Label {
-                    width: parent.width
-                    text: qsTr("SDL audio: maximum queued audio in Moonlight's buffer (ms)")
-                    font.pointSize: 12
-                    wrapMode: Text.Wrap
-                }
-
-                TextField {
-                    id: audioDropThresholdField
-                    width: Math.min(parent.width, 120)
-                    text: StreamingPreferences.audioDropThresholdMs.toString()
-                    maximumLength: 4
-                    inputMethodHints: Qt.ImhDigitsOnly
-                    validator: IntValidator { bottom: 1; top: 1000 }
-
-                    onEditingFinished: {
-                        commitAudioThresholdSettings()
-                    }
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: qsTr("SDL audio only. Default: 30 ms. Increase this if you want Moonlight to tolerate more queued audio before dropping new samples.")
-                }
-
                 CheckBox {
                     id: audioPcCheck
                     width: parent.width
@@ -1712,8 +1642,12 @@ Flickable {
                             val: StreamingPreferences.VCC_FORCE_HEVC
                         }
                         ListElement {
-                            text: qsTr("AV1 (Experimental)")
+                            text: qsTr("AV1")
                             val: StreamingPreferences.VCC_FORCE_AV1
+                        }
+                        ListElement {
+                            text: qsTr("PyroWave")
+                            val: StreamingPreferences.VCC_FORCE_PYROWAVE
                         }
                     }
                     // ::onActivated must be used, as it only listens for when the index is changed by a human
@@ -1725,32 +1659,9 @@ Flickable {
                 }
 
                 CheckBox {
-                    id: enableHdr
-                    width: parent.width
-                    text: qsTr("Enable HDR (Experimental)")
-                    font.pointSize: 12
-
-                    enabled: SystemProperties.supportsHdr
-                    checked: enabled && StreamingPreferences.enableHdr
-                    onCheckedChanged: {
-                        StreamingPreferences.enableHdr = checked
-                    }
-
-                    // Updating StreamingPreferences.videoCodecConfig is handled above
-
-                    ToolTip.delay: 1000
-                    ToolTip.timeout: 5000
-                    ToolTip.visible: hovered
-                    ToolTip.text: enabled ?
-                                      qsTr("The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.")
-                                    :
-                                      qsTr("HDR streaming is not supported on this PC.")
-                }
-
-                CheckBox {
                     id: enableYUV444
                     width: parent.width
-                    text: qsTr("Enable YUV 4:4:4 (Experimental)")
+                    text: qsTr("Enable YUV 4:4:4")
                     font.pointSize: 12
 
                     checked: StreamingPreferences.enableYUV444

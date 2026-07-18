@@ -6,6 +6,7 @@
 #include <Limelight.h>
 
 #include <SDL_syswm.h>
+#include <QtMath>
 
 extern "C" {
 #include <libavutil/pixdesc.h>
@@ -355,7 +356,7 @@ ReadbackRetry:
             av_dict_set_int(&options, "dstw", m_RgbFrame->width, 0);
             av_dict_set_int(&options, "dsth", m_RgbFrame->height, 0);
             av_dict_set_int(&options, "dst_format", m_RgbFrame->format, 0);
-            av_dict_set_int(&options, "threads", std::min(SDL_GetCPUCount(), 4), 0); // Up to 4 threads
+            av_dict_set_int(&options, "threads", qMin(SDL_GetCPUCount(), 4), 0); // Up to 4 threads
 
             err = av_opt_set_dict(m_SwsContext, &options);
             av_dict_free(&options);
@@ -575,11 +576,6 @@ ReadbackRetry:
 
     // Ensure the viewport is set to the desired video region
     SDL_RenderSetViewport(m_Renderer, &dst);
-
-    // Use nearest pixel sampling if the video region size is a multiple of the frame size
-    SDL_SetTextureScaleMode(m_Texture,
-                            dst.w % frame->width == 0 && dst.h % frame->height == 0 ?
-                                SDL_ScaleModeNearest : SDL_ScaleModeLinear);
 
     // Draw the video content itself
     SDL_RenderCopy(m_Renderer, m_Texture, nullptr, nullptr);

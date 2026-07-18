@@ -157,8 +157,8 @@ win32:!winrt {
 }
 macx {
     !disable-prebuilts {
-        LIBS += -lssl.3 -lcrypto.3 -lavcodec.62 -lavutil.60 -lswscale.9 -lopus -lSDL2 -lSDL2_ttf
-        CONFIG += discord-rpc
+        LIBS += -lssl.3 -lcrypto.3 -lavcodec.62 -lavutil.60 -lswscale.9 -lopus.0 -lSDL2 -lSDL2_ttf -lplacebo
+        CONFIG += discord-rpc libplacebo
     }
 
     LIBS += -lobjc \
@@ -292,6 +292,37 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/framepacing/framepacer.h \
         streaming/video/ffmpeg-renderers/framepacing/framequeue.h
 }
+# PyroWave (Vulkan wavelet, intra-only) decoder. Off by default; enable with CONFIG+=pyrowave.
+# Requires the pyrowave submodule built via its own CMake (produces libpyrowave-shared) with
+# Granite fetched (pyrowave/checkout_granite.sh). See plan/docs for the build recipe.
+pyrowave {
+    message(PyroWave decoder selected)
+
+    DEFINES += HAVE_PYROWAVE
+
+    # PyroWave C API + Vulkan headers, both vendored under the pyrowave submodule.
+    INCLUDEPATH += $$PWD/../pyrowave
+    INCLUDEPATH += $$PWD/../pyrowave/Granite/third_party/khronos/vulkan-headers/include
+
+    SOURCES += streaming/video/pyrowave.cpp
+    HEADERS += streaming/video/pyrowave.h
+
+    macx {
+        # macOS uses the shared-VkDevice path (MoltenVK has no dmabuf/external-fd interop):
+        # no libdrm, and no Vulkan loader link — all Vulkan entry points are resolved at
+        # runtime through SDL's vkGetInstanceProcAddr (which loads the bundled MoltenVK).
+        LIBS += -L$$PWD/../pyrowave/build -lpyrowave-shared
+    } else {
+        # drm_fourcc.h for the dmabuf plane-export constants (header-only use; independent of the
+        # drm renderer, which the AppImage build disables via CONFIG+=disable-libdrm).
+        PKGCONFIG += libdrm
+
+        # Link the PyroWave C API shared library (built via CMake into pyrowave/build) + Vulkan loader.
+        LIBS += -L$$PWD/../pyrowave/build -lpyrowave-shared -lvulkan
+    }
+    # Bake the shared-lib location into the runtime search path.
+    QMAKE_RPATHDIR += $$PWD/../pyrowave/build
+}
 libva {
     message(VAAPI renderer selected)
 
@@ -379,6 +410,10 @@ libplacebo {
         streaming/video/ffmpeg-renderers/plvk_c.c
     HEADERS += \
         streaming/video/ffmpeg-renderers/plvk.h
+
+    macx {
+        SOURCES += streaming/video/ffmpeg-renderers/plvk_objc.mm
+    }
 }
 config_EGL {
     message(EGL renderer selected)
@@ -619,6 +654,9 @@ macx {
 
     !disable-prebuilts {
         APP_BUNDLE_FRAMEWORKS.files = $$files(../libs/mac/Frameworks/*.framework, true) $$files(../libs/mac/lib/*.dylib, true)
+        # Ship the PyroWave decoder library in the bundle so @rpath resolves it without the
+        # build-tree rpath (also needed by its internal loader for the headless probe device).
+        pyrowave: APP_BUNDLE_FRAMEWORKS.files += $$files(../pyrowave/build/libpyrowave-shared*.dylib)
         APP_BUNDLE_FRAMEWORKS.path = Contents/Frameworks
 
         QMAKE_BUNDLE_DATA += APP_BUNDLE_FRAMEWORKS

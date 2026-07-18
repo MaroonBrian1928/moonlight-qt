@@ -20,6 +20,10 @@
 #include "video/slvid.h"
 #endif
 
+#ifdef HAVE_PYROWAVE
+#include "video/pyrowave.h"
+#endif
+
 #ifdef Q_OS_WIN32
 // Scaling the icon down on Win32 looks dreadful, so render at lower res
 #define ICON_SIZE 32
@@ -297,6 +301,23 @@ bool Session::chooseDecoder(StreamingPreferences::VideoDecoderSelection vds,
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "V-sync %s",
                 enableVsync ? "enabled" : "disabled");
+
+#ifdef HAVE_PYROWAVE
+    if (videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+        chosenDecoder = new PyroWaveVideoDecoder(testOnly);
+        if (chosenDecoder->initialize(&params)) {
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                        "PyroWave video decoder chosen");
+            return true;
+        }
+        else {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "Unable to load PyroWave decoder");
+            delete chosenDecoder;
+            chosenDecoder = nullptr;
+        }
+    }
+#endif
 
 #ifdef HAVE_SLVIDEO
     chosenDecoder = new SLVideoDecoder(testOnly);
@@ -742,6 +763,14 @@ bool Session::initialize(QQuickWindow* qtWindow)
                 CHANNEL_MASK_FROM_AUDIO_CONFIGURATION(m_StreamConfig.audioConfiguration));
 
     // Start with all codecs and profiles in priority order
+#ifdef HAVE_PYROWAVE
+    // PyroWave (intra-only, low latency) is preferred when both ends support it.
+    // Profile order mirrors AV1: 10-bit 4:4:4, 10-bit, 8-bit 4:4:4, 8-bit.
+    m_SupportedVideoFormats.append(VIDEO_FORMAT_PYROWAVE10_444);
+    m_SupportedVideoFormats.append(VIDEO_FORMAT_PYROWAVE10_420);
+    m_SupportedVideoFormats.append(VIDEO_FORMAT_PYROWAVE_444);
+    m_SupportedVideoFormats.append(VIDEO_FORMAT_PYROWAVE);
+#endif
     m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_HIGH10_444);
     m_SupportedVideoFormats.append(VIDEO_FORMAT_AV1_MAIN10);
     m_SupportedVideoFormats.append(VIDEO_FORMAT_H265_REXT10_444);
@@ -757,6 +786,20 @@ bool Session::initialize(QQuickWindow* qtWindow)
     {
     case StreamingPreferences::VCC_AUTO:
     {
+#ifdef HAVE_PYROWAVE
+        // PyroWave is offered (at top priority) only if this client can actually decode it; if not,
+        // drop it so Automatic falls back to the conventional codecs. When both ends support it, it
+        // wins on merit (intra-only, sub-ms latency).
+        if (getDecoderAvailability(testWindow,
+                                   m_Preferences->videoDecoderSelection,
+                                   VIDEO_FORMAT_PYROWAVE,
+                                   m_StreamConfig.width,
+                                   m_StreamConfig.height,
+                                   m_StreamConfig.fps) == DecoderAvailability::None) {
+            m_SupportedVideoFormats.removeByMask(VIDEO_FORMAT_MASK_PYROWAVE);
+        }
+#endif
+
         // Codecs are checked in order of ascending decode complexity to ensure
         // the the deprioritized list prefers lighter codecs for software decoding
 
@@ -862,6 +905,10 @@ bool Session::initialize(QQuickWindow* qtWindow)
 #endif
         break;
     }
+    case StreamingPreferences::VCC_FORCE_PYROWAVE:
+        // PyroWave has no fallback codec; forcing it requires host + client support.
+        m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_PYROWAVE);
+        break;
     case StreamingPreferences::VCC_FORCE_H264:
         m_SupportedVideoFormats.removeByMask(~VIDEO_FORMAT_MASK_H264);
         break;
@@ -1513,10 +1560,8 @@ void Session::updateOptimalWindowDisplayMode()
     SDL_SetWindowDisplayMode(m_Window, &bestMode);
 }
 
-void Session::toggleFullscreen()
+void Session::setWindowMode(uint32_t windowMode)
 {
-    bool fullScreen = !(SDL_GetWindowFlags(m_Window) & m_FullScreenFlag);
-
 #if defined(Q_OS_WIN32) || defined(Q_OS_DARWIN)
     // Destroy the video decoder before toggling full-screen because D3D9 can try
     // to put the window back into full-screen before we've managed to destroy
@@ -1532,14 +1577,29 @@ void Session::toggleFullscreen()
     SDL_UnlockMutex(m_DecoderLock);
 #endif
 
+    uint32_t sdlWindowMode = 0;
+    switch (windowMode) {
+        case StreamingPreferences::WM_FULLSCREEN:
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Switching to SDL window mode SDL_WINDOW_FULLSCREEN");
+            sdlWindowMode = SDL_WINDOW_FULLSCREEN;
+            break;
+        case StreamingPreferences::WM_FULLSCREEN_DESKTOP:
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Switching to SDL window mode SDL_WINDOW_FULLSCREEN_DESKTOP");
+            sdlWindowMode = SDL_WINDOW_FULLSCREEN_DESKTOP;
+            break;
+        case StreamingPreferences::WM_WINDOWED:
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Switching to SDL windowed mode");
+            break;
+    }
+
     // Actually enter/leave fullscreen
-    SDL_SetWindowFullscreen(m_Window, fullScreen ? m_FullScreenFlag : 0);
+    SDL_SetWindowFullscreen(m_Window, sdlWindowMode);
 
 #ifdef Q_OS_DARWIN
     // SDL on macOS has a bug that causes the window size to be reset to crazy
     // large dimensions when exiting out of true fullscreen mode. We can work
     // around the issue by manually resetting the position and size here.
-    if (!fullScreen && m_FullScreenFlag == SDL_WINDOW_FULLSCREEN) {
+    if (windowMode == StreamingPreferences::WM_WINDOWED && m_FullScreenFlag == SDL_WINDOW_FULLSCREEN) {
         int x, y, width, height;
         getWindowDimensions(x, y, width, height);
         SDL_SetWindowSize(m_Window, width, height);
@@ -1552,6 +1612,21 @@ void Session::toggleFullscreen()
 
     // Input handler might need stop/stop mouse grab after changing modes
     m_InputHandler->updatePointerRegionLock();
+}
+
+void Session::toggleFullscreen()
+{
+    // Swap between windowed mode and the recommended fullscreen mode
+    bool fullScreen = !(SDL_GetWindowFlags(m_Window) & m_FullScreenFlag);
+
+    uint32_t targetWindowMode = StreamingPreferences::WM_WINDOWED;
+    if (fullScreen) {
+        targetWindowMode = m_FullScreenFlag == SDL_WINDOW_FULLSCREEN
+            ? StreamingPreferences::WM_FULLSCREEN
+            : StreamingPreferences::WM_FULLSCREEN_DESKTOP;
+    }
+
+    setWindowMode(targetWindowMode);
 }
 
 void Session::notifyMouseEmulationMode(bool enabled)
@@ -2059,8 +2134,8 @@ void Session::exec()
                 m_InputHandler->setAdaptiveTriggers((uint16_t)(uintptr_t)event.user.data1,
                                                     (DualSenseOutputReport *)event.user.data2);
                 break;
-            case SDL_CODE_TOGGLE_FULLSCREEN:
-                toggleFullscreen();
+            case SDL_CODE_SET_WINDOW_MODE:
+                setWindowMode((uint32_t)(uintptr_t)event.user.data1);
                 break;
             default:
                 SDL_assert(false);

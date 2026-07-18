@@ -47,7 +47,8 @@ public:
         VCC_FORCE_H264,
         VCC_FORCE_HEVC,
         VCC_FORCE_HEVC_HDR_DEPRECATED, // Kept for backwards compatibility
-        VCC_FORCE_AV1
+        VCC_FORCE_AV1,
+        VCC_FORCE_PYROWAVE
     };
     Q_ENUM(VideoCodecConfig)
 
@@ -127,6 +128,8 @@ public:
     {
         RENDERER_VT_METAL = 0,
         RENDERER_AVSAMPLEBUFFER = 1,
+        RENDERER_VULKAN = 2,
+        RENDERER_D3D11 = 3,
     };
     Q_ENUM(Renderer)
 

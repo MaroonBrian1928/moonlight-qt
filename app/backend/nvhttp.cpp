@@ -18,9 +18,16 @@
 #define RESUME_TIMEOUT_MS 30000
 #define QUIT_TIMEOUT_MS 30000
 
-NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert, QNetworkAccessManager* nam) :
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+#define XML_NAME_EQUALS(x, y) ((x) == (y))
+#else
+#define XML_NAME_EQUALS(x, y) ((x) == (u##y))
+#endif
+
+NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert, bool useTrueUid, QNetworkAccessManager* nam) :
     m_Nam(nam ? nam : new QNetworkAccessManager(this)),
-    m_ServerCert(serverCert)
+    m_ServerCert(serverCert),
+    m_UseTrueUid(useTrueUid)
 {
     m_BaseUrlHttp.setScheme("http");
     m_BaseUrlHttps.setScheme("https");
@@ -34,9 +41,8 @@ NvHTTP::NvHTTP(NvAddress address, uint16_t httpsPort, QSslCertificate serverCert
 }
 
 NvHTTP::NvHTTP(NvComputer* computer, QNetworkAccessManager* nam) :
-    NvHTTP(computer->activeAddress, computer->activeHttpsPort, computer->serverCert, nam)
+    NvHTTP(computer->activeAddress, computer->activeHttpsPort, computer->serverCert, !computer->isNvidiaServerSoftware, nam)
 {
-
 }
 
 void NvHTTP::setServerCert(QSslCertificate serverCert)
@@ -59,6 +65,11 @@ void NvHTTP::setAddress(NvAddress address)
 void NvHTTP::setHttpsPort(uint16_t port)
 {
     m_BaseUrlHttps.setPort(port);
+}
+
+void NvHTTP::setTrueUid(bool useTrueUid)
+{
+    m_UseTrueUid = useTrueUid;
 }
 
 NvAddress NvHTTP::address()
@@ -109,7 +120,7 @@ NvHTTP::getCurrentGame(QString serverInfo)
     // has the semantics that its name would indicate. To contain the effects of this change as much
     // as possible, we'll force the current game to zero if the server isn't in a streaming session.
     QString serverState = getXmlString(serverInfo, "state");
-    if (serverState != nullptr && serverState.endsWith("_SERVER_BUSY"))
+    if (serverState.endsWith("_SERVER_BUSY"))
     {
         return getXmlString(serverInfo, "currentgame").toInt();
     }
@@ -266,17 +277,19 @@ NvHTTP::getDisplayModeList(QString serverInfo)
     while (!xmlReader.atEnd()) {
         while (xmlReader.readNextStartElement()) {
             auto name = xmlReader.name();
-            if (name == QString("DisplayMode")) {
+            if (XML_NAME_EQUALS(name, "DisplayMode")) {
                 modes.append(NvDisplayMode());
             }
-            else if (name == QString("Width")) {
-                modes.last().width = xmlReader.readElementText().toInt();
-            }
-            else if (name == QString("Height")) {
-                modes.last().height = xmlReader.readElementText().toInt();
-            }
-            else if (name == QString("RefreshRate")) {
-                modes.last().refreshRate = xmlReader.readElementText().toInt();
+            else if (!modes.isEmpty()) {
+                if (XML_NAME_EQUALS(name, "Width")) {
+                    modes.last().width = xmlReader.readElementText().toInt();
+                }
+                else if (XML_NAME_EQUALS(name, "Height")) {
+                    modes.last().height = xmlReader.readElementText().toInt();
+                }
+                else if (XML_NAME_EQUALS(name, "RefreshRate")) {
+                    modes.last().refreshRate = xmlReader.readElementText().toInt();
+                }
             }
         }
     }
@@ -299,7 +312,7 @@ NvHTTP::getAppList()
     while (!xmlReader.atEnd()) {
         while (xmlReader.readNextStartElement()) {
             auto name = xmlReader.name();
-            if (name == QString("App")) {
+            if (XML_NAME_EQUALS(name, "App")) {
                 // We must have a valid app before advancing to the next one
                 if (!apps.isEmpty() && !apps.last().isInitialized()) {
                     qWarning() << "Invalid applist XML";
@@ -307,17 +320,28 @@ NvHTTP::getAppList()
                 }
                 apps.append(NvApp());
             }
-            else if (name == QString("AppTitle")) {
-                apps.last().name = xmlReader.readElementText();
-            }
-            else if (name == QString("ID")) {
-                apps.last().id = xmlReader.readElementText().toInt();
-            }
-            else if (name == QString("IsHdrSupported")) {
-                apps.last().hdrSupported = xmlReader.readElementText() == "1";
-            }
-            else if (name == QString("IsAppCollectorGame")) {
-                apps.last().isAppCollectorGame = xmlReader.readElementText() == "1";
+            else if (!apps.isEmpty()) {
+                if (XML_NAME_EQUALS(name, "AppTitle")) {
+                    // If an app has no name, Sunshine may send us <AppTitle/>,
+                    // which readElementText() returns as a null QString.
+                    // We want to treat this as an empty QString instead, so we
+                    // will explicitly convert it. An empty string will satisfy
+                    // NvApp's isInitialized() check.
+                    QString name = xmlReader.readElementText();
+                    if (name.isNull()) {
+                        name = "";
+                    }
+                    apps.last().name = name;
+                }
+                else if (XML_NAME_EQUALS(name, "ID")) {
+                    apps.last().id = xmlReader.readElementText().toInt();
+                }
+                else if (XML_NAME_EQUALS(name, "IsHdrSupported")) {
+                    apps.last().hdrSupported = xmlReader.readElementText() == "1";
+                }
+                else if (XML_NAME_EQUALS(name, "IsAppCollectorGame")) {
+                    apps.last().isAppCollectorGame = xmlReader.readElementText() == "1";
+                }
             }
         }
     }
@@ -332,7 +356,7 @@ NvHTTP::verifyResponseStatus(QString xml)
 
     while (xmlReader.readNextStartElement())
     {
-        if (xmlReader.name() == QString("root"))
+        if (XML_NAME_EQUALS(xmlReader.name(), "root"))
         {
             // Status code can be 0xFFFFFFFF in some rare cases on GFE 3.20.3, and
             // QString::toInt() will fail in that case, so use QString::toUInt()
@@ -383,13 +407,7 @@ QByteArray
 NvHTTP::getXmlStringFromHex(QString xml,
                             QString tagName)
 {
-    QString str = getXmlString(xml, tagName);
-    if (str == nullptr)
-    {
-        return nullptr;
-    }
-
-    return QByteArray::fromHex(str.toUtf8());
+    return QByteArray::fromHex(getXmlString(xml, tagName).toUtf8());
 }
 
 QString
@@ -411,7 +429,7 @@ NvHTTP::getXmlString(QString xml,
         }
     }
 
-    return nullptr;
+    return QString();
 }
 
 void NvHTTP::handleSslErrors(QNetworkReply* reply, const QList<QSslError>& errors)
@@ -474,11 +492,9 @@ NvHTTP::openConnection(QUrl baseUrl,
     QUrl url(baseUrl);
     url.setPath("/" + command);
 
-    // Use a common UID for Moonlight clients to allow them to quit
-    // games for each other (otherwise GFE gets screwed up and it requires
-    // manual intervention to solve).
-    url.setQuery("uniqueid=0123456789ABCDEF&uuid=" +
-                 QUuid::createUuid().toRfc4122().toHex() +
+    // Use a placeholder UID for GFE allow them to quit games for each other.
+    url.setQuery("uniqueid=" + (m_UseTrueUid ? IdentityManager::get()->getUniqueId() : "0123456789ABCDEF") +
+                 "&uuid=" + QUuid::createUuid().toRfc4122().toHex() +
                  ((arguments != nullptr) ? ("&" + arguments) : ""));
 
     QNetworkRequest request(url);

@@ -53,21 +53,72 @@ Column {
             font.pointSize: 12
             wrapMode: Text.Wrap
             Layout.fillWidth: true
-            visible: Qt.platform.os === "osx"
         }
 
         AutoResizingComboBox {
-            id: rendererComboBox
+            id: rendererComboBoxWindows
+            Layout.fillWidth: true
+            textRole: "text"
+            visible: Qt.platform.os === "windows"
+
+            model: ListModel {
+                id: rendererListModelWindows
+
+                ListElement {
+                    text: qsTr("D3D11 (recommended)")
+                    val: StreamingPreferences.RENDERER_D3D11
+                }
+
+                ListElement {
+                    text: qsTr("Vulkan")
+                    val: StreamingPreferences.RENDERER_VULKAN
+                }
+            }
+
+            Component.onCompleted: {
+                if (!visible) {
+                    return
+                }
+
+                currentIndex = 0
+                for (var i = 0; i < rendererListModelWindows.count; i++) {
+                    if (StreamingPreferences.renderer === rendererListModelWindows.get(i).val) {
+                        currentIndex = i
+                        break
+                    }
+                }
+
+                activated(currentIndex)
+            }
+
+            onActivated: {
+                StreamingPreferences.renderer = rendererListModelWindows.get(currentIndex).val
+            }
+
+            ToolTip.delay: 1000
+            ToolTip.timeout: -1
+            ToolTip.visible: hovered
+            ToolTip.text:
+                qsTr("D3D11 is the default Windows renderer. Vulkan is experimental.")
+        }
+
+        AutoResizingComboBox {
+            id: rendererComboBoxMac
             Layout.fillWidth: true
             textRole: "text"
             visible: Qt.platform.os === "osx"
 
             model: ListModel {
-                id: rendererListModel
+                id: rendererListModelMac
 
                 ListElement {
                     text: qsTr("Metal (recommended)")
                     val: StreamingPreferences.RENDERER_VT_METAL
+                }
+
+                ListElement {
+                    text: qsTr("Vulkan (MoltenVK)")
+                    val: StreamingPreferences.RENDERER_VULKAN
                 }
 
                 ListElement {
@@ -82,8 +133,8 @@ Column {
                 }
 
                 currentIndex = 0
-                for (var i = 0; i < rendererListModel.count; i++) {
-                    if (StreamingPreferences.renderer === rendererListModel.get(i).val) {
+                for (var i = 0; i < rendererListModelMac.count; i++) {
+                    if (StreamingPreferences.renderer === rendererListModelMac.get(i).val) {
                         currentIndex = i
                         break
                     }
@@ -93,7 +144,7 @@ Column {
             }
 
             onActivated: {
-                StreamingPreferences.renderer = rendererListModel.get(currentIndex).val
+                StreamingPreferences.renderer = rendererListModelMac.get(currentIndex).val
             }
 
             ToolTip.delay: 1000
@@ -104,12 +155,28 @@ Column {
                 qsTr("AVSampleBuffer lets macOS control the rendering and can be used if Metal doesn't work for you.")
         }
 
+        // Placeholder for future Windows renderer options
         AutoResizingComboBox {
-            id: rendererOptionsComboBox
+            id: rendererOptionsComboBoxWindows
+            Layout.fillWidth: true
+            textRole: "text"
+            visible: Qt.platform.os === "windows"
+            enabled: false
+            model: ListModel {
+                id: rendererOptionsListModelWindows
+
+                ListElement {
+                    text: qsTr("None")
+                }
+            }
+        }
+
+        AutoResizingComboBox {
+            id: rendererOptionsComboBoxMac
             Layout.fillWidth: true
             textRole: "text"
             visible: Qt.platform.os === "osx"
-            enabled: !rendererComboBox.visible ||
+            enabled: !rendererComboBoxMac.visible ||
                      StreamingPreferences.renderer === StreamingPreferences.RENDERER_VT_METAL
 
             model: ListModel {
@@ -177,12 +244,12 @@ Column {
             function createModel() {
                 var model = Qt.createQmlObject('import QtQuick 2.0; ListModel {}', root, '')
 
-                if (Qt.platform.os !== "osx") {
+                //if (Qt.platform.os !== "osx") {
                     model.append({
                         text: qsTr("Fullscreen"),
                         val: StreamingPreferences.WM_FULLSCREEN
                     })
-                }
+                //}
 
                 model.append({
                     text: qsTr("Borderless windowed"),
@@ -231,8 +298,6 @@ Column {
             Layout.fillWidth: true
             hoverEnabled: true
             textRole: "text"
-            enabled: !rendererComboBox.visible ||
-                     StreamingPreferences.renderer === StreamingPreferences.RENDERER_VT_METAL
 
             model: ListModel {
                 id: framePacingListModel
@@ -300,8 +365,6 @@ Column {
             text: qsTr("Show performance graphs")
             font.pointSize: 12
             checked: StreamingPreferences.showPerformanceGraphs
-            enabled: !rendererComboBox.visible ||
-                        StreamingPreferences.renderer === StreamingPreferences.RENDERER_VT_METAL
 
             onCheckedChanged: {
                 StreamingPreferences.showPerformanceGraphs = checked
@@ -321,6 +384,29 @@ Column {
             text: qsTr("Use <font color=\"skyblue\">Select+Start</font> or <font color=\"skyblue\">Ctrl+Alt+Shift+Space</font> to open the Quick Menu to show/hide stats, graphs, and other advanced controls.")
             font.pointSize: 12
             wrapMode: Text.WordWrap
+        }
+
+        CheckBox {
+            id: enableHdr
+            width: parent.width
+            text: qsTr("Enable HDR")
+            font.pointSize: 12
+
+            enabled: SystemProperties.supportsHdr
+            checked: enabled && StreamingPreferences.enableHdr
+            onCheckedChanged: {
+                StreamingPreferences.enableHdr = checked
+            }
+
+            // Updating StreamingPreferences.videoCodecConfig is handled above
+
+            ToolTip.delay: 1000
+            ToolTip.timeout: 5000
+            ToolTip.visible: hovered
+            ToolTip.text: enabled ?
+                                qsTr("The stream will be HDR-capable, but some games may require an HDR monitor on your host PC to enable HDR mode.")
+                            :
+                                qsTr("HDR streaming is not supported on this PC.")
         }
     }
 }

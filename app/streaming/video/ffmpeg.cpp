@@ -359,7 +359,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
             if (!vulkanIsSlow) {
                 // The Vulkan renderer can also handle HDR with a supported compositor. We prefer
                 // rendering HDR with Vulkan if possible since it's more fully featured than DRM.
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params) && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_HDR_SUPPORT)) {
                     return true;
                 }
@@ -387,7 +387,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
             if (vulkanIsSlow) {
                 // Try Vulkan even if it's slow because we have no other renderer
                 // that can display HDR properly on Linux.
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params) && (m_FrontendRenderer->getRendererAttributes() & RENDERER_ATTRIBUTE_HDR_SUPPORT)) {
                     return true;
                 }
@@ -400,7 +400,7 @@ bool FFmpegVideoDecoder::createFrontendRenderer(PDECODER_PARAMETERS params, bool
         {
 #ifdef HAVE_LIBPLACEBO_VULKAN
             if (qgetenv("PREFER_VULKAN") == "1") {
-                m_FrontendRenderer = new PlVkRenderer(false, m_BackendRenderer);
+                m_FrontendRenderer = new PlVkRenderer(AV_HWDEVICE_TYPE_NONE, m_BackendRenderer);
                 if (initializeRendererInternal(m_FrontendRenderer, params)) {
                     return true;
                 }
@@ -760,8 +760,12 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-            // Prefer the Metal renderer if hardware is compatible
-            return VTMetalRendererFactory::createRenderer(true);
+            // Prefer the libplacebo (on MoltenVK) renderer unless explicitly opted out
+  #ifdef HAVE_LIBPLACEBO_VULKAN
+            if (qgetenv("PREFER_VULKAN") != "0") {
+                return new PlVkRenderer(hwDecodeCfg->device_type);
+            }
+  #endif
 #endif
 #ifdef HAVE_LIBVA
         case AV_HWDEVICE_TYPE_VAAPI:
@@ -777,7 +781,7 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef HAVE_LIBPLACEBO_VULKAN
         case AV_HWDEVICE_TYPE_VULKAN:
-            return new PlVkRenderer(true);
+            return new PlVkRenderer(hwDecodeCfg->device_type);
 #endif
         default:
             switch (hwDecodeCfg->pix_fmt) {
@@ -811,8 +815,8 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
 #endif
 #ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
-            // Use the older AVSampleBufferDisplayLayer if Metal cannot be used
-            return VTRendererFactory::createRenderer();
+            // Metal renderer is tried second
+            return VTMetalRendererFactory::createRenderer(true);
 #endif
 #ifdef HAVE_LIBVA
         case AV_HWDEVICE_TYPE_VAAPI:
@@ -835,7 +839,11 @@ IFFmpegRenderer* FFmpegVideoDecoder::createHwAccelRenderer(const AVCodecHWConfig
         case AV_HWDEVICE_TYPE_VAAPI:
         case AV_HWDEVICE_TYPE_DXVA2:
         case AV_HWDEVICE_TYPE_QSV: // Covered by VAAPI and D3D11VA/DXVA2
+#ifdef Q_OS_DARWIN
         case AV_HWDEVICE_TYPE_VIDEOTOOLBOX:
+            // Use the older AVSampleBufferDisplayLayer if Metal cannot be used
+            return VTRendererFactory::createRenderer();
+#endif
         case AV_HWDEVICE_TYPE_D3D11VA:
         case AV_HWDEVICE_TYPE_DRM:
 #if LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(56, 39, 100)
@@ -922,10 +930,10 @@ bool FFmpegVideoDecoder::tryInitializeRenderer(const AVCodec* decoder,
         *failureReason = IFFmpegRenderer::InitFailureReason::Unknown;
     }
 
-    // i == 0 - Indirect via EGL or DRM frontend with zero-copy DMA-BUF passing
-    // i == 1 - Direct rendering or indirect via SDL read-back
+    // i == 0 - Indirect via EGL, DRM, or Vulkan frontend with zero-copy buffer passing
+    // i == 1 - Direct rendering or indirect via SDL or DRM read-back
     bool backendInitFailure = false;
-#ifdef HAVE_EGL
+#if defined(Q_OS_UNIX) && !defined(Q_OS_DARWIN) && (defined(HAVE_EGL) || defined(HAVE_DRM) || defined(HAVE_LIBPLACEBO_VULKAN))
     for (int i = 0; i < 2 && !backendInitFailure; i++) {
 #else
     for (int i = 1; i < 2 && !backendInitFailure; i++) {

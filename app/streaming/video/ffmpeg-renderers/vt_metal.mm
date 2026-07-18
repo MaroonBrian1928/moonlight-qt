@@ -117,6 +117,7 @@ public:
           m_MetalLayer(nullptr),
           m_TextureCache(nullptr),
           m_CVMetalTextures{},
+          m_Activity(nullptr),
           m_CscParamsBuffer(nullptr),
           m_VideoVertexBuffer(nullptr),
           m_OverlayTextures{},
@@ -254,6 +255,14 @@ public:
         if (m_MetalView != nullptr) {
             SDL_Metal_DestroyView(m_MetalView);
         }
+
+        // Reduce our process priority
+        // if (m_Activity != nullptr) {
+        //     [[NSProcessInfo processInfo] endActivity:m_Activity];
+        //     [m_Activity release];
+        //     m_Activity = nullptr;
+        //     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Ending macOS latency-critical activity.");
+        // }
     }}
 
 #ifndef IMGUI_DISABLE
@@ -899,7 +908,7 @@ public:
             DevUISettings::instance().UpdateMetrics([&](DevUIMetrics& metrics) {
                 metrics.presentMode = pfi.presentMode;
                 metrics.presentAtTime = pfi.atTime;
-                metrics.presentAfterMinimumDuration = pfi.afterMinimumDuration;
+                metrics.presentAMDHistory.add(pfi.afterMinimumDuration);
                 if (pfi.submittedPresentTime > pfi.vsyncDeadline) {
                     // we missed the current deadline
                     metrics.presentLateMs.add((pfi.submittedPresentTime - pfi.vsyncDeadline) * 1000.0);
@@ -1297,6 +1306,7 @@ public:
             m_MetalLayer.device = device;
             m_MetalLayer.maximumDrawableCount = std::clamp(m_MaxFramesInFlight.load(), 2, 3);
             m_MetalLayer.allowsNextDrawableTimeout = YES;
+            m_MetalLayer.opaque = YES;
 
             // Allow EDR content if we're streaming in a 10-bit format
             m_MetalLayer.wantsExtendedDynamicRangeContent = !!(params->videoFormat & VIDEO_FORMAT_MASK_10BIT);
@@ -1322,6 +1332,12 @@ public:
                             "V-sync enforced when running in a window");
             }
         }
+
+        // This doesn't seem to produce any benefit...
+        // m_Activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical
+        //                                                                reason:@"Moonlight low-latency"];
+        // [m_Activity retain];
+        // SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Begin macOS latency-critical activity.");
 
         return true;
     }}
@@ -1454,6 +1470,15 @@ public:
                 return;
             }
 
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Display change: %s", [screen.localizedName UTF8String]);
+            NSDictionary *deviceDescription = screen.deviceDescription;
+            [deviceDescription enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+                NSString *keyString = [key description];
+                NSString *valueString = [value description];
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "%s: %s",
+                            keyString.UTF8String, valueString.UTF8String);
+            }];
+
             // SDL's display change detection will call notifyWindowChanged() but there are some Apple-specific
             // notifications we need to watch out for, such as moving off screen or into the background.
             // We still have to decode everything anyway, but DisplayLink changes framerates when the window is not
@@ -1489,6 +1514,15 @@ public:
                     }
                 }
             }
+
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Min/max refresh interval: %.2f/%.2f ms",
+                        m_MinRefreshInterval * 1000.0, m_MaxRefreshInterval * 1000.0);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Display update granularity: %.2f ms",
+                        screen.displayUpdateGranularity);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Supports VRR: %s",
+                        isVRR ? "yes" : (isProMotion ? "no, display is ProMotion" : "no, only one refresh interval"));
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Is fullscreen: %s",
+                        m_IsFullScreen ? "yes" : "no");
 
             m_SupportsVRR.store(false);
 
@@ -1767,6 +1801,7 @@ private:
     CAMetalLayer* m_MetalLayer;
     CVMetalTextureCacheRef m_TextureCache;
     CVMetalTextureRef m_CVMetalTextures[MAX_FRAMES_IN_FLIGHT][MAX_VIDEO_PLANES];
+    id<NSObject> m_Activity;
     id<MTLBuffer> m_CscParamsBuffer;
     id<MTLBuffer> m_VideoVertexBuffer;
     id<MTLTexture> m_OverlayTextures[Overlay::OverlayMax];

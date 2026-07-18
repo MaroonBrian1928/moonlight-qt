@@ -17,7 +17,7 @@
 #define SDL_CODE_GAMECONTROLLER_SET_MOTION_EVENT_STATE 103
 #define SDL_CODE_GAMECONTROLLER_SET_CONTROLLER_LED 104
 #define SDL_CODE_GAMECONTROLLER_SET_ADAPTIVE_TRIGGERS 105
-#define SDL_CODE_TOGGLE_FULLSCREEN 106
+#define SDL_CODE_SET_WINDOW_MODE 106
 
 class SupportedVideoFormatList : public QList<int>
 {
@@ -80,6 +80,10 @@ public:
             {SCM_AV1_MAIN10, VIDEO_FORMAT_AV1_MAIN10},
             {SCM_AV1_HIGH8_444, VIDEO_FORMAT_AV1_HIGH8_444},
             {SCM_AV1_HIGH10_444, VIDEO_FORMAT_AV1_HIGH10_444},
+            {SCM_PYROWAVE, VIDEO_FORMAT_PYROWAVE},
+            {SCM_PYROWAVE_444, VIDEO_FORMAT_PYROWAVE_444},
+            {SCM_PYROWAVE10_420, VIDEO_FORMAT_PYROWAVE10_420},
+            {SCM_PYROWAVE10_444, VIDEO_FORMAT_PYROWAVE10_444},
         };
 
         for (QMap<int, int>::const_iterator it = mapping.cbegin(); it != mapping.cend(); ++it) {
@@ -144,6 +148,8 @@ public:
     void setShouldExit(bool quitHostApp = false);
 
     void toggleMouseEmulation(SDL_JoystickID jsid);
+
+    void setWindowMode(uint32_t windowMode);
 
     void toggleFullscreen();
 

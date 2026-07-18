@@ -1,6 +1,7 @@
 [submodule "moonlight-common-c/moonlight-common-c"]
 	path = moonlight-common-c/moonlight-common-c
-	url = https://github.com/moonlight-stream/moonlight-common-c.git
+	url = https://github.com/azafrob/moonlight-common-c.git
+	branch = pyrowave-protocol
 [submodule "qmdnsengine/qmdnsengine"]
 	path = qmdnsengine/qmdnsengine
 	url = https://github.com/cgutman/qmdnsengine.git
@@ -10,6 +11,9 @@
 [submodule "h264bitstream/h264bitstream"]
 	path = h264bitstream/h264bitstream
 	url = https://github.com/aizvorski/h264bitstream.git
+[submodule "pyrowave"]
+	path = pyrowave
+	url = https://github.com/andygrundman/pyrowave.git
 [submodule "libs"]
 	path = libs
 	url = https://github.com/cgutman/moonlight-qt-prebuilts.git
