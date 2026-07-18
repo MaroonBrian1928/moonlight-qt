@@ -290,7 +290,7 @@ void CoreAudioRenderer::updateMetrics()
         strncpy(metrics.audioOutputDeviceName, m_OutputDeviceName, sizeof(metrics.audioOutputDeviceName));
         metrics.audioSampleRate = m_OutputASBD.mSampleRate;
         metrics.audioChannels = m_OutputASBD.mChannelsPerFrame;
-        metrics.spatialAudio = m_Spatial;
+        metrics.spatialAudioActive = m_Spatial;
         metrics.audioPersonalizedHRTF = m_SpatialAU.m_PersonalizedHRTF;
         metrics.audioHeadTracking = m_SpatialAU.getHeadTracking();
         strncpy(metrics.audioOutputTransportType, m_OutputTransportType, 5);
