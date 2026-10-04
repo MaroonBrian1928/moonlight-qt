@@ -23,6 +23,10 @@
 #include "vulkantiming.h"
 #endif
 
+#ifdef HAVE_PYROWAVE
+#include "plvkpyrowave.h"
+#endif
+
 #ifdef HAS_WAYLAND
 #include "waylandfeedback/wayland.h"
 #ifdef Q_OS_LINUX
@@ -93,6 +97,9 @@ public:
     virtual int getDecoderCapabilities() override;
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
+#ifdef HAVE_PYROWAVE
+    virtual IPyroWaveVulkanSurfaces* getPyroWaveVulkanSurfaces() override { return m_PyroWaveSurfaces.get(); }
+#endif
 
 private:
     static void lockQueue(AVHWDeviceContext *dev_ctx, uint32_t queue_family, uint32_t index);
@@ -288,4 +295,9 @@ private:
     PFN_vkGetPhysicalDeviceProperties fn_vkGetPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR fn_vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties fn_vkEnumerateDeviceExtensionProperties = nullptr;
+
+#ifdef HAVE_PYROWAVE
+    // PyroWave: planes the decoder writes on this device (null for other codecs)
+    std::unique_ptr<PlVkPyroWaveSurfaces> m_PyroWaveSurfaces;
+#endif
 };

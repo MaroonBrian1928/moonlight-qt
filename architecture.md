@@ -27,7 +27,16 @@ stays 0 (single device). Frames are never partial yet: an incomplete or rejected
 frame is dropped without an IDR request, since the next frame is independent.
 Verified on the Radeon 890M by `tests/pyrowave` (framing rules, real-encoder
 round trip, and 40-frame D3D11 surface/fence cycles at 4:2:0/4:4:4, R8/R16);
-no live host session yet. VRR policy and replay are unchanged.
+no live host session yet. VRR policy and replay are unchanged. On macOS the decoder
+shares the libplacebo renderer's MoltenVK device (`PlVkPyroWaveSurfaces`, after
+Andy Grundman's shared-device design): the renderer requests every supported
+device feature, owns ten surfaces of three storage+sampled plane textures, and
+keeps them held (`pl_vulkan_hold_ex`) for the decoder between renders. Mapping
+a frame releases its planes behind the decode timeline semaphore; unmapping
+holds them again and signals the surface's hold semaphore, which the next
+decode into that surface waits for. PyroWave submits to libplacebo's first
+graphics queue under libplacebo's queue lock. If the libplacebo renderer is
+unavailable, `decodeToMemory()` reads 8-bit frames back for the SDL renderer.
 
 Balanced readiness floor (2026-09-24), based on `fae3eefe`: the interval-quality
 score averages absolute interval error over one second, which dilutes an

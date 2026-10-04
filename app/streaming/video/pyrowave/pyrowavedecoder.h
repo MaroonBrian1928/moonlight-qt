@@ -3,6 +3,8 @@
 #include "pyrowaveframing.h"
 #include "pyrowavesurfaces.h"
 
+class IPyroWaveVulkanSurfaces;
+
 #include <memory>
 #include <string>
 #include <vector>
@@ -11,9 +13,12 @@ extern "C" {
 #include <libavutil/frame.h>
 }
 
-// Decodes PyroWave frames on a private Vulkan device into shared surfaces owned
-// by the renderer (see IPyroWaveSurfacePool). Not thread safe: decode() must be
-// called from one thread. Frames it produces may be freed from any thread.
+// Decodes PyroWave frames into surfaces owned by the renderer: on a private
+// Vulkan device into shared OS handles (IPyroWaveSurfacePool), or on the
+// renderer's own Vulkan device (IPyroWaveVulkanSurfaces). Without either, it
+// decodes into system memory as 8-bit YUV420P/YUV444P frames that any renderer
+// can upload. Not thread safe: decode() must be called from one thread. Frames it
+// produces may be freed from any thread.
 class PyroWaveDecoder
 {
 public:
@@ -30,9 +35,12 @@ public:
     PyroWaveDecoder(const PyroWaveDecoder&) = delete;
     PyroWaveDecoder& operator=(const PyroWaveDecoder&) = delete;
 
-    bool initialize(const Config& config, IPyroWaveSurfacePool* pool);
+    // Pass at most one of pool and vulkanSurfaces. With neither, output goes to
+    // system memory, which waits for each decode on the CPU and is 8-bit only.
+    bool initialize(const Config& config, IPyroWaveSurfacePool* pool,
+                    IPyroWaveVulkanSurfaces* vulkanSurfaces = nullptr);
 
-    // Parses and decodes one frame into a free surface. The GPU work is only
+    // Parses and decodes one frame. With a surface pool, the GPU work is only
     // submitted: the frame's PyroWaveFrameRef carries the decode fence value
     // to wait for. On success, frame receives the surface reference and its
     // format/size/colour metadata. Returns false if the frame was dropped.
@@ -54,6 +62,9 @@ public:
     PyroWaveFraming::Framing lastFraming() const { return m_LastFraming; }
 
 private:
+    bool decodeToMemory(AVFrame* frame);
+    bool decodeToSurface(AVFrame* frame);
+
     struct Impl;
     std::unique_ptr<Impl> m_Impl;
     std::string m_LastError;

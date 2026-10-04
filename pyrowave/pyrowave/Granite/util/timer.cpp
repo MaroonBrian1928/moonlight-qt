@@ -138,6 +138,15 @@ void sleep_until_nsecs(int64_t timepoint)
 		_mm_pause();
 #endif
 	}
+#elif defined(__APPLE__)
+	int64_t d;
+	while ((d = timepoint - get_current_time_nsecs()) > 0)
+	{
+		struct timespec ts = {};
+		ts.tv_sec = d / 1000000000ll;
+		ts.tv_nsec = d % 1000000000ll;
+		nanosleep(&ts, nullptr);
+	}
 #else
 	constexpr auto timebase = CLOCK_MONOTONIC;
 	struct timespec ts = {};

@@ -1,0 +1,26 @@
+Sleep relative to the timer's own clock on macOS.
+
+macOS has no clock_nanosleep or TIMER_ABSTIME, so Granite's util/timer.cpp
+does not compile there. Andy Grundman's pyrowave fork (Granite-macos.patch)
+carries an equivalent fix.
+
+diff --git a/Granite/util/timer.cpp b/Granite/util/timer.cpp
+index a1408352..cbeb52b9 100644
+--- a/Granite/util/timer.cpp
++++ b/Granite/util/timer.cpp
+@@ -138,6 +138,15 @@ void sleep_until_nsecs(int64_t timepoint)
+ 		_mm_pause();
+ #endif
+ 	}
++#elif defined(__APPLE__)
++	int64_t d;
++	while ((d = timepoint - get_current_time_nsecs()) > 0)
++	{
++		struct timespec ts = {};
++		ts.tv_sec = d / 1000000000ll;
++		ts.tv_nsec = d % 1000000000ll;
++		nanosleep(&ts, nullptr);
++	}
+ #else
+ 	constexpr auto timebase = CLOCK_MONOTONIC;
+ 	struct timespec ts = {};

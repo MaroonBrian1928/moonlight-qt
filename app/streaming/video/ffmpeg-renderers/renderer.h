@@ -139,6 +139,7 @@ private:
 
 class IVrrFramePresenter;
 class IPyroWaveSurfacePool;
+class IPyroWaveVulkanSurfaces;
 
 class GpuTrace;
 class IFFmpegRenderer : public Overlay::IOverlayRenderer {
@@ -274,6 +275,12 @@ public:
     // PyroWave decoder writes into. Only valid after initialize() succeeded
     // for a PyroWave video format.
     virtual IPyroWaveSurfacePool* getPyroWaveSurfacePool() {
+        return nullptr;
+    }
+
+    // Vulkan renderers instead let the PyroWave decoder share their device
+    // and write into their plane images directly.
+    virtual IPyroWaveVulkanSurfaces* getPyroWaveVulkanSurfaces() {
         return nullptr;
     }
 

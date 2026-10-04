@@ -104,8 +104,7 @@ SystemProperties::SystemProperties()
     hasDiscordIntegration = false;
 #endif
 
-    // PyroWave decoding currently presents through the D3D11 renderer only
-#if defined(HAVE_PYROWAVE) && defined(Q_OS_WIN32)
+#ifdef HAVE_PYROWAVE
     hasPyroWave = true;
 #else
     hasPyroWave = false;

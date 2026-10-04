@@ -18,7 +18,7 @@ win32:!winrt {
 
 # PyroWave codec library (see pyrowave/VENDOR.txt). Must match the condition
 # in app/app.pro.
-win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
+if(win32:!winrt:contains(QT_ARCH, x86_64)|macx):!disable-pyrowave {
     SUBDIRS += pyrowave
     app.depends += pyrowave
 }

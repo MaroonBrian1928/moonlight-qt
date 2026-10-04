@@ -305,6 +305,10 @@ PlVkRenderer::~PlVkRenderer()
     // The render context must have been cleaned up by now.
     SDL_assert(!m_HasPendingSwapchainFrame);
 
+#ifdef HAVE_PYROWAVE
+    m_PyroWaveSurfaces.reset();
+#endif
+
     if (m_Vulkan != nullptr) {
 #ifdef PLVK_USE_EARLY_RENDER_TO_WAIT
         pl_tex_destroy(m_Vulkan->gpu, &m_EmptyOverlay.tex);
@@ -544,6 +548,14 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
 #endif
     vkParams.opt_extensions = optionalExtensions.data();
     vkParams.num_opt_extensions = int(optionalExtensions.size());
+
+#ifdef HAVE_PYROWAVE
+    if (decoderParams->videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+        // The PyroWave decoder runs its compute work on this device
+        m_PyroWaveSurfaces = std::make_unique<PlVkPyroWaveSurfaces>();
+        vkParams.features = m_PyroWaveSurfaces->queryDeviceFeatures(m_PlVkInstance, device);
+    }
+#endif
 
     {
         // Don't let Qt take DRM master from us during pl_vulkan_create()
@@ -825,6 +837,16 @@ bool PlVkRenderer::initialize(PDECODER_PARAMETERS params)
     }
 #endif
 
+#ifdef HAVE_PYROWAVE
+    if (m_PyroWaveSurfaces &&
+            !m_PyroWaveSurfaces->initialize(m_PlVkInstance, m_Vulkan, params->width, params->height,
+                                            (params->videoFormat & VIDEO_FORMAT_MASK_YUV444) != 0,
+                                            (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0)) {
+        m_PyroWaveSurfaces.reset();
+        return false;
+    }
+#endif
+
     return true;
 }
 
@@ -1047,6 +1069,14 @@ bool PlVkRenderer::prepareDecoderContext(AVCodecContext *context, AVDictionary *
 
 bool PlVkRenderer::mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFrame, pl_tex* textures)
 {
+#ifdef HAVE_PYROWAVE
+    if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
+        if (!m_PyroWaveSurfaces || !m_PyroWaveSurfaces->map(frame, pyroWaveRef, mappedFrame)) {
+            return false;
+        }
+    }
+    else
+#endif
 #ifdef Q_OS_DARWIN
     if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
         if (!m_MetalTextureFactory->mapVideoToolboxToPlacebo(frame, mappedFrame)) {
@@ -1092,17 +1122,23 @@ bool PlVkRenderer::mapAvFrameToPlacebo(const AVFrame *frame, pl_frame* mappedFra
 
 void PlVkRenderer::unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappedFrame)
 {
+#ifdef HAVE_PYROWAVE
+    if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
+        m_PyroWaveSurfaces->unmap(pyroWaveRef);
+        return;
+    }
+#endif
+
 #ifdef Q_OS_DARWIN
     if (frame->format == AV_PIX_FMT_VIDEOTOOLBOX) {
         m_MetalTextureFactory->unmapVideoToolboxFromPlacebo(mappedFrame);
+        return;
     }
-    else
 #else
     Q_UNUSED(frame)
 #endif
-    {
-        pl_unmap_avframe(m_Vulkan->gpu, mappedFrame);
-    }
+
+    pl_unmap_avframe(m_Vulkan->gpu, mappedFrame);
 }
 
 bool PlVkRenderer::populateQueues(int videoFormat)
@@ -1437,6 +1473,11 @@ void PlVkRenderer::gpuRenderInfo(void* opaque, const pl_render_info* info)
 
 uint64_t PlVkRenderer::waitForDecode(AVFrame* frame)
 {
+#ifdef HAVE_PYROWAVE
+    if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
+        return m_PyroWaveSurfaces ? m_PyroWaveSurfaces->waitForDecode(pyroWaveRef) : 0;
+    }
+#endif
 #ifdef HAVE_LIBVA
     if (frame == nullptr || frame->format != AV_PIX_FMT_VAAPI ||
             frame->hw_frames_ctx == nullptr) {
@@ -1860,7 +1901,7 @@ void PlVkRenderer::prepareImage(const std::shared_ptr<PreparedImage>& image)
         queueRenderDeviceReset();
     }
     image->timing.readyUs = LiGetMicroseconds();
-    pl_unmap_avframe(m_Vulkan->gpu, &source);
+    unmapAvFrameFromPlacebo(image->source, &source);
     if (m_GpuTrace) {
         m_GpuTrace->record({"stage_render", image->source->pts,
             uint64_t(image->source->pkt_dts), image->timing.renderStartUs,

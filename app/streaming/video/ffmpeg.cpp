@@ -2214,13 +2214,14 @@ bool FFmpegVideoDecoder::tryInitializeNonHwAccelDecoder(PDECODER_PARAMETERS para
 
 bool FFmpegVideoDecoder::initializePyroWave(PDECODER_PARAMETERS params)
 {
-#if defined(HAVE_PYROWAVE) && defined(Q_OS_WIN32)
+#ifdef HAVE_PYROWAVE
     // PyroWave is a GPU codec with no software fallback
     if (params->vds == StreamingPreferences::VDS_FORCE_SOFTWARE) {
         SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
                     "PyroWave requires GPU decoding; ignoring the software decoding preference");
     }
 
+#ifdef Q_OS_WIN32
     m_BackendRenderer = new D3D11VARenderer(0);
     if (!initializeRendererInternal(m_BackendRenderer, params)) {
         delete m_BackendRenderer;
@@ -2233,6 +2234,32 @@ bool FFmpegVideoDecoder::initializePyroWave(PDECODER_PARAMETERS params)
         reset();
         return false;
     }
+#else
+    // A Vulkan renderer shares its device and planes with the decoder.
+    // Otherwise PyroWave decodes into system memory and the frames are
+    // presented like software-decoded YUV.
+    IPyroWaveSurfacePool* pool = nullptr;
+    const AVPixelFormat pixelFormat = (params->videoFormat & VIDEO_FORMAT_MASK_YUV444) ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
+    const std::function<IFFmpegRenderer*()> rendererFactories[] = {
+#ifdef HAVE_LIBPLACEBO_VULKAN
+        []() -> IFFmpegRenderer* { return new PlVkRenderer(); },
+#endif
+        []() -> IFFmpegRenderer* { return new SdlRenderer(); },
+    };
+    for (const auto& createRenderer : rendererFactories) {
+        m_BackendRenderer = createRenderer();
+        if (initializeRendererInternal(m_BackendRenderer, params) &&
+                (m_BackendRenderer->getPyroWaveVulkanSurfaces() != nullptr ||
+                 m_BackendRenderer->isPixelFormatSupported(params->videoFormat, pixelFormat))) {
+            break;
+        }
+        delete m_BackendRenderer;
+        m_BackendRenderer = nullptr;
+    }
+    if (m_BackendRenderer == nullptr) {
+        return false;
+    }
+#endif
 
     PyroWaveDecoder::Config config;
     config.width = params->width;
@@ -2241,7 +2268,7 @@ bool FFmpegVideoDecoder::initializePyroWave(PDECODER_PARAMETERS params)
     config.tenBit = (params->videoFormat & VIDEO_FORMAT_MASK_10BIT) != 0;
 
     m_PyroWave = std::make_unique<PyroWaveDecoder>();
-    if (!m_PyroWave->initialize(config, pool)) {
+    if (!m_PyroWave->initialize(config, pool, m_BackendRenderer->getPyroWaveVulkanSurfaces())) {
         reset();
         return false;
     }
@@ -2307,6 +2334,19 @@ int FFmpegVideoDecoder::sendPyroWaveFrame(int length)
         frame->color_primaries = AVCOL_PRI_BT2020;
         frame->color_trc = AVCOL_TRC_SMPTE2084;
         frame->colorspace = AVCOL_SPC_BT2020_NCL;
+    }
+    else {
+        switch (m_FrontendRenderer->getDecoderColorspace()) {
+        case COLORSPACE_REC_601:
+            frame->colorspace = AVCOL_SPC_SMPTE170M;
+            break;
+        case COLORSPACE_REC_709:
+            frame->colorspace = AVCOL_SPC_BT709;
+            break;
+        case COLORSPACE_REC_2020:
+            frame->colorspace = AVCOL_SPC_BT2020_NCL;
+            break;
+        }
     }
 
     m_PyroWaveOutput.enqueue(frame);

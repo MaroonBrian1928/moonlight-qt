@@ -1,4 +1,5 @@
 #include "pyrowavedecoder.h"
+#include "pyrowavevulkansurfaces.h"
 
 #include <vulkan/vulkan.h>
 #include <pyrowave.h>
@@ -106,11 +107,16 @@ struct PyroWaveDecoder::Impl {
     pyrowave_decoder decoder = nullptr;
     pyrowave_sync_object decodeSync = nullptr;
     pyrowave_sync_object releaseSync = nullptr;
+    // Signalled by each decode; waited on by the renderer
+    VkSemaphore decodeSemaphore = VK_NULL_HANDLE;
     uint64_t decodeValue = 0;
 
     struct Surface {
+        // Imported images (null when the planes live on the renderer's device)
         std::array<pyrowave_image, 3> images {};
         pyrowave_gpu_buffers buffers {};
+        // Signalled by the renderer once it stops reading the surface
+        VkSemaphore holdSemaphore = VK_NULL_HANDLE;
     };
     std::vector<Surface> surfaces;
     std::shared_ptr<SurfaceFreeList> freeList = std::make_shared<SurfaceFreeList>();
@@ -236,6 +242,7 @@ struct PyroWaveDecoder::Impl {
             return false;
         }
 
+        surface.holdSemaphore = pyrowave_sync_object_get_semaphore(releaseSync);
         surfaces.push_back(surface);
         return true;
     }
@@ -245,11 +252,17 @@ PyroWaveDecoder::PyroWaveDecoder() = default;
 
 PyroWaveDecoder::~PyroWaveDecoder() = default;
 
-bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* pool)
+bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* pool,
+                                 IPyroWaveVulkanSurfaces* vulkanSurfaces)
 {
     SDL_assert(!m_Impl);
 
-    if (pool == nullptr || config.width <= 0 || config.height <= 0) {
+    if (config.width <= 0 || config.height <= 0) {
+        return false;
+    }
+    if (pool == nullptr && vulkanSurfaces == nullptr && config.tenBit) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: system memory output is 8-bit only");
         return false;
     }
     if (!config.chroma444 && ((config.width | config.height) & 1)) {
@@ -266,24 +279,33 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
     uint32_t major = 0, minor = 0, patch = 0;
     pyrowave_get_api_version(&major, &minor, &patch);
 
-    uint8_t luid[8];
-    if (!pool->pyroWaveAdapterLuid(luid)) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: renderer adapter identity is unavailable");
-        return false;
-    }
+    pyrowave_result result;
+    if (pool != nullptr) {
+        uint8_t luid[8];
+        if (!pool->pyroWaveAdapterLuid(luid)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: renderer adapter identity is unavailable");
+            return false;
+        }
 
-    static_assert(sizeof(pyrowave_luid) == sizeof(luid), "LUID size mismatch");
-    pyrowave_result result = pyrowave_create_device_by_compat(
-        0, 0, nullptr, nullptr, reinterpret_cast<const pyrowave_luid*>(luid), &impl->device);
+        static_assert(sizeof(pyrowave_luid) == sizeof(luid), "LUID size mismatch");
+        result = pyrowave_create_device_by_compat(
+            0, 0, nullptr, nullptr, reinterpret_cast<const pyrowave_luid*>(luid), &impl->device);
+    }
+    else if (vulkanSurfaces != nullptr) {
+        result = pyrowave_create_device(vulkanSurfaces->pyroWaveDeviceInfo(), &impl->device);
+    }
+    else {
+        result = pyrowave_create_default_device(&impl->device);
+    }
     if (result != PYROWAVE_SUCCESS) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: no Vulkan device for the renderer's adapter: %s",
+                     "PyroWave: no usable Vulkan device: %s",
                      resultString(result));
         return false;
     }
 
-    if (!pyrowave_device_confirm_interop_support(impl->device)) {
+    if (pool != nullptr && !pyrowave_device_confirm_interop_support(impl->device)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "PyroWave: the Vulkan driver cannot import D3D11 textures and fences");
         return false;
@@ -303,16 +325,29 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
         return false;
     }
 
-    if (!impl->importFence(pool->exportPyroWaveDecodeFence(), impl->decodeSync) ||
-            !impl->importFence(pool->exportPyroWaveReleaseFence(), impl->releaseSync)) {
-        return false;
-    }
-
-    for (int i = 0; i < pool->pyroWaveSurfaceCount(); i++) {
-        if (!impl->importSurface(pool, i)) {
+    if (pool != nullptr) {
+        if (!impl->importFence(pool->exportPyroWaveDecodeFence(), impl->decodeSync) ||
+                !impl->importFence(pool->exportPyroWaveReleaseFence(), impl->releaseSync)) {
             return false;
         }
-        impl->freeList->push(i, 0);
+        impl->decodeSemaphore = pyrowave_sync_object_get_semaphore(impl->decodeSync);
+
+        for (int i = 0; i < pool->pyroWaveSurfaceCount(); i++) {
+            if (!impl->importSurface(pool, i)) {
+                return false;
+            }
+            impl->freeList->push(i, 0);
+        }
+    }
+    else if (vulkanSurfaces != nullptr) {
+        impl->decodeSemaphore = vulkanSurfaces->pyroWaveDecodeSemaphore();
+        for (int i = 0; i < vulkanSurfaces->pyroWaveSurfaceCount(); i++) {
+            Impl::Surface surface;
+            uint64_t holdValue;
+            vulkanSurfaces->pyroWaveSurface(i, &surface.buffers, &surface.holdSemaphore, &holdValue);
+            impl->surfaces.push_back(surface);
+            impl->freeList->push(i, holdValue);
+        }
     }
 
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
@@ -374,6 +409,56 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
     }
     m_LastFramePartial = impl.parsed.partial;
 
+    frame->width = impl.config.width;
+    frame->height = impl.config.height;
+    if (impl.config.tenBit) {
+        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV420P10;
+    }
+    else {
+        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
+    }
+    // Hosts average each 2x2 quad for 4:2:0 chroma
+    frame->chroma_location = AVCHROMA_LOC_CENTER;
+    frame->flags |= AV_FRAME_FLAG_KEY;
+
+    return impl.surfaces.empty() ? decodeToMemory(frame) : decodeToSurface(frame);
+}
+
+bool PyroWaveDecoder::decodeToMemory(AVFrame* frame)
+{
+    Impl& impl = *m_Impl;
+
+    // ponytail: a fresh allocation per frame; switch to an AVBufferPool if it shows up in profiles
+    if (av_frame_get_buffer(frame, 0) < 0) {
+        m_LastError = "out of memory";
+        return false;
+    }
+
+    pyrowave_cpu_buffer buffer = {};
+    buffer.width = frame->width;
+    buffer.height = frame->height;
+    buffer.format = impl.config.chroma444 ? PYROWAVE_CPU_BUFFER_FORMAT_YUV444P : PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
+    for (int plane = 0; plane < 3; plane++) {
+        const int planeHeight = (plane == 0 || impl.config.chroma444) ? frame->height : frame->height / 2;
+        buffer.data[plane] = frame->data[plane];
+        buffer.row_stride_in_bytes[plane] = frame->linesize[plane];
+        buffer.plane_size_in_bytes[plane] = size_t(frame->linesize[plane]) * planeHeight;
+    }
+
+    const pyrowave_result result = pyrowave_decoder_decode_cpu_buffer_synchronous(impl.decoder, &buffer);
+    if (result != PYROWAVE_SUCCESS) {
+        av_frame_unref(frame);
+        m_LastError = std::string("decode failed: ") + resultString(result);
+        return false;
+    }
+
+    return true;
+}
+
+bool PyroWaveDecoder::decodeToSurface(AVFrame* frame)
+{
+    Impl& impl = *m_Impl;
+
     int surface;
     uint64_t releaseValue;
     if (!impl.freeList->pop(surface, releaseValue)) {
@@ -381,32 +466,41 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
         return false;
     }
 
+    const Impl::Surface& target = impl.surfaces[surface];
+
+    // Imported images change ownership around the decode; planes on the
+    // renderer's device are already held for the decoder in GENERAL layout.
     std::array<pyrowave_gpu_external_reference, 3> acquireImages;
     std::array<pyrowave_gpu_external_reference, 3> releaseImages;
+    const bool imported = target.images[0] != nullptr;
     for (int plane = 0; plane < 3; plane++) {
         // The previous contents are overwritten, so discard them
-        acquireImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_IGNORED };
-        releaseImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_EXTERNAL };
+        acquireImages[plane] = { target.images[plane], VK_QUEUE_FAMILY_IGNORED };
+        releaseImages[plane] = { target.images[plane], VK_QUEUE_FAMILY_EXTERNAL };
     }
 
     pyrowave_gpu_sync_operation acquire = {};
-    acquire.images = acquireImages.data();
-    acquire.num_images = acquireImages.size();
+    if (imported) {
+        acquire.images = acquireImages.data();
+        acquire.num_images = acquireImages.size();
+    }
     if (releaseValue != 0) {
         // Wait on the GPU until the renderer finished its last read
-        acquire.sync.semaphore = pyrowave_sync_object_get_semaphore(impl.releaseSync);
+        acquire.sync.semaphore = target.holdSemaphore;
         acquire.sync.value = releaseValue;
     }
 
     const uint64_t decodeValue = impl.decodeValue + 1;
     pyrowave_gpu_sync_operation release = {};
-    release.images = releaseImages.data();
-    release.num_images = releaseImages.size();
-    release.sync.semaphore = pyrowave_sync_object_get_semaphore(impl.decodeSync);
+    if (imported) {
+        release.images = releaseImages.data();
+        release.num_images = releaseImages.size();
+    }
+    release.sync.semaphore = impl.decodeSemaphore;
     release.sync.value = decodeValue;
 
     const pyrowave_result result = pyrowave_decoder_decode_gpu_buffer(
-        impl.decoder, &acquire, &release, &impl.surfaces[surface].buffers);
+        impl.decoder, &acquire, &release, &target.buffers);
     if (result != PYROWAVE_SUCCESS) {
         impl.freeList->push(surface, releaseValue);
         m_LastError = std::string("decode submission failed: ") + resultString(result);
@@ -430,18 +524,6 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
         m_LastError = "out of memory";
         return false;
     }
-
-    frame->width = impl.config.width;
-    frame->height = impl.config.height;
-    if (impl.config.tenBit) {
-        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV420P10;
-    }
-    else {
-        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
-    }
-    // Hosts average each 2x2 quad for 4:2:0 chroma
-    frame->chroma_location = AVCHROMA_LOC_CENTER;
-    frame->flags |= AV_FRAME_FLAG_KEY;
 
     return true;
 }
