@@ -6,8 +6,6 @@
 #include <Limelight.h>
 #include <SDL.h>
 
-#include <cstring>
-
 namespace {
 
 constexpr uint64_t k_DecodeWaitTimeoutNs = 100000000;
@@ -118,8 +116,19 @@ bool PlVkPyroWaveSurfaces::initialize(pl_vk_inst instance, pl_vulkan vulkan,
         }
     }
 
-    // PyroWave submits only to libplacebo's first graphics queue, under
-    // libplacebo's lock for it.
+    // PyroWave submits only to libplacebo's first graphics queue. Its lock
+    // takes every libplacebo queue, since Granite also uses it around
+    // vkDeviceWaitIdle(), which must not overlap any queue's submissions.
+    for (const pl_vulkan_queue& queue : { vulkan->queue_graphics, vulkan->queue_compute, vulkan->queue_transfer }) {
+        bool known = false;
+        for (const auto& q : m_Queues) {
+            known |= q.first == queue.index;
+        }
+        for (uint32_t i = 0; !known && i < queue.count; i++) {
+            m_Queues.emplace_back(queue.index, i);
+        }
+    }
+
     m_AppInfo = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
     m_AppInfo.apiVersion = instance->api_version;
     m_InstanceInfo = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
@@ -153,12 +162,10 @@ bool PlVkPyroWaveSurfaces::initialize(pl_vk_inst instance, pl_vulkan vulkan,
     m_DeviceInfo.queue_info = &m_Queue;
     m_DeviceInfo.queue_info_count = 1;
     m_DeviceInfo.queue_lock_callback = [](void* userdata) {
-        auto self = static_cast<PlVkPyroWaveSurfaces*>(userdata);
-        self->m_Vulkan->lock_queue(self->m_Vulkan, self->m_Queue.familyIndex, self->m_Queue.index);
+        static_cast<PlVkPyroWaveSurfaces*>(userdata)->lockQueues();
     };
     m_DeviceInfo.queue_unlock_callback = [](void* userdata) {
-        auto self = static_cast<PlVkPyroWaveSurfaces*>(userdata);
-        self->m_Vulkan->unlock_queue(self->m_Vulkan, self->m_Queue.familyIndex, self->m_Queue.index);
+        static_cast<PlVkPyroWaveSurfaces*>(userdata)->unlockQueues();
     };
     m_DeviceInfo.userdata = this;
 
@@ -186,6 +193,20 @@ PlVkPyroWaveSurfaces::~PlVkPyroWaveSurfaces()
     }
 }
 
+void PlVkPyroWaveSurfaces::lockQueues()
+{
+    for (const auto& queue : m_Queues) {
+        m_Vulkan->lock_queue(m_Vulkan, queue.first, queue.second);
+    }
+}
+
+void PlVkPyroWaveSurfaces::unlockQueues()
+{
+    for (auto queue = m_Queues.rbegin(); queue != m_Queues.rend(); ++queue) {
+        m_Vulkan->unlock_queue(m_Vulkan, queue->first, queue->second);
+    }
+}
+
 bool PlVkPyroWaveSurfaces::hold(int surface, uint64_t* value)
 {
     Surface& s = m_Surfaces[surface];
@@ -201,7 +222,8 @@ bool PlVkPyroWaveSurfaces::hold(int surface, uint64_t* value)
             return false;
         }
     }
-    // The planes' holds are queued in order, so the last value covers all three
+    // Each hold is its own submission, in order, so the last value covers all
+    // three planes.
     *value = s.holdValue;
     return true;
 }
@@ -249,15 +271,19 @@ bool PlVkPyroWaveSurfaces::map(const AVFrame* frame, const PyroWaveFrameRef* ref
     return true;
 }
 
-void PlVkPyroWaveSurfaces::unmap(PyroWaveFrameRef* ref)
+bool PlVkPyroWaveSurfaces::unmap(PyroWaveFrameRef* ref)
 {
     uint64_t value;
-    if (hold(ref->surface, &value)) {
-        ref->noteRelease(value);
+    if (!hold(ref->surface, &value)) {
+        // Some planes may still belong to libplacebo
+        ref->noteRelease(PyroWaveFrameRef::k_Quarantined);
+        return false;
     }
+    ref->noteRelease(value);
+    return true;
 }
 
-uint64_t PlVkPyroWaveSurfaces::waitForDecode(const PyroWaveFrameRef* ref)
+bool PlVkPyroWaveSurfaces::waitForDecode(const PyroWaveFrameRef* ref, uint64_t* waitUs)
 {
     VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
     waitInfo.semaphoreCount = 1;
@@ -265,11 +291,13 @@ uint64_t PlVkPyroWaveSurfaces::waitForDecode(const PyroWaveFrameRef* ref)
     waitInfo.pValues = &ref->decodeFenceValue;
 
     const uint64_t startUs = LiGetMicroseconds();
-    if (m_WaitSemaphores(m_Vulkan->device, &waitInfo, k_DecodeWaitTimeoutNs) != VK_SUCCESS) {
+    const VkResult result = m_WaitSemaphores(m_Vulkan->device, &waitInfo, k_DecodeWaitTimeoutNs);
+    *waitUs = LiGetMicroseconds() - startUs;
+    if (result != VK_SUCCESS) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave decode semaphore wait failed (target=%llu)",
-                     (unsigned long long)ref->decodeFenceValue);
-        return 0;
+                     "PyroWave decode semaphore wait failed: %d (target=%llu)",
+                     result, (unsigned long long)ref->decodeFenceValue);
+        return false;
     }
-    return LiGetMicroseconds() - startUs;
+    return true;
 }

@@ -551,9 +551,13 @@ bool PlVkRenderer::tryInitializeDevice(VkPhysicalDevice device, VkPhysicalDevice
 
 #ifdef HAVE_PYROWAVE
     if (decoderParams->videoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
-        // The PyroWave decoder runs its compute work on this device
+        // The PyroWave decoder runs its compute work on this device. Without
+        // Vulkan 1.3 it cannot, and the decoder writes system memory instead.
         m_PyroWaveSurfaces = std::make_unique<PlVkPyroWaveSurfaces>();
         vkParams.features = m_PyroWaveSurfaces->queryDeviceFeatures(m_PlVkInstance, device);
+        if (vkParams.features == nullptr) {
+            m_PyroWaveSurfaces.reset();
+        }
     }
 #endif
 
@@ -1124,7 +1128,9 @@ void PlVkRenderer::unmapAvFrameFromPlacebo(const AVFrame *frame, pl_frame* mappe
 {
 #ifdef HAVE_PYROWAVE
     if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
-        m_PyroWaveSurfaces->unmap(pyroWaveRef);
+        if (!m_PyroWaveSurfaces->unmap(pyroWaveRef)) {
+            queueRenderDeviceReset();
+        }
         return;
     }
 #endif
@@ -1475,7 +1481,13 @@ uint64_t PlVkRenderer::waitForDecode(AVFrame* frame)
 {
 #ifdef HAVE_PYROWAVE
     if (auto* pyroWaveRef = PyroWaveFrameRef::fromFrame(frame)) {
-        return m_PyroWaveSurfaces ? m_PyroWaveSurfaces->waitForDecode(pyroWaveRef) : 0;
+        uint64_t waitUs = 0;
+        if (m_PyroWaveSurfaces && !m_PyroWaveSurfaces->waitForDecode(pyroWaveRef, &waitUs)) {
+            m_VrrFallbackReason = VrrFallbackReason::AdaptivePresentationUnavailable;
+            queueRenderDeviceReset();
+            return 0;
+        }
+        return waitUs;
     }
 #endif
 #ifdef HAVE_LIBVA

@@ -520,9 +520,9 @@ wayland {
     DEFINES += HAVE_H264BITSTREAM
 }
 
-# PyroWave decoding (Vulkan compute) presents through the D3D11 renderer on
-# Windows and decodes into system memory on macOS (MoltenVK). Granite has no
-# MSVC ARM64 SIMD path.
+# PyroWave decoding (Vulkan compute) writes into the D3D11 renderer's textures
+# on Windows and into the libplacebo renderer's on macOS (MoltenVK). Granite has
+# no MSVC ARM64 SIMD path.
 if(win32:!winrt:contains(QT_ARCH, x86_64)|macx):!disable-pyrowave {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave

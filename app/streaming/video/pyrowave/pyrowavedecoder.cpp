@@ -13,31 +13,41 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <SDL_vulkan.h>
+#include <dlfcn.h>
+#include <cstdlib>
 #endif
 
 namespace {
 
+// A surface the decoder may overwrite once its GPU wait completes
+struct FreeSurface {
+    int surface;
+    // Wait for this value of the renderer's release (hold) semaphore, or of
+    // the decode semaphore if the last write was never sampled. 0: no wait.
+    uint64_t waitValue;
+    bool waitForDecode;
+};
+
 // Returned to the decoder when the last reference to a frame is dropped.
 struct SurfaceFreeList {
     std::mutex lock;
-    // Surface index and the release fence value that must complete before the
-    // decoder may overwrite it (0 if the renderer never sampled it).
-    std::deque<std::pair<int, uint64_t>> free;
+    std::deque<FreeSurface> free;
 
-    void push(int surface, uint64_t releaseValue)
+    void push(const FreeSurface& entry)
     {
         std::lock_guard<std::mutex> guard(lock);
-        free.emplace_back(surface, releaseValue);
+        free.push_back(entry);
     }
 
-    bool pop(int& surface, uint64_t& releaseValue)
+    bool pop(FreeSurface& entry)
     {
         std::lock_guard<std::mutex> guard(lock);
         if (free.empty()) {
             return false;
         }
-        surface = free.front().first;
-        releaseValue = free.front().second;
+        entry = free.front();
         free.pop_front();
         return true;
     }
@@ -52,7 +62,19 @@ void freeFrameRef(void* opaque, uint8_t* data)
     auto owner = static_cast<FrameOwner*>(opaque);
     auto ref = reinterpret_cast<PyroWaveFrameRef*>(data);
 
-    owner->freeList->push(ref->surface, ref->releaseFenceValue.load(std::memory_order_acquire));
+    const uint64_t releaseValue = ref->releaseFenceValue.load(std::memory_order_acquire);
+    if (releaseValue == PyroWaveFrameRef::k_Quarantined) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "PyroWave: retiring surface %d, which the renderer could not hand back",
+                    ref->surface);
+    }
+    else if (releaseValue == 0) {
+        // Never sampled: order the next write after this frame's decode
+        owner->freeList->push({ ref->surface, ref->decodeFenceValue, true });
+    }
+    else {
+        owner->freeList->push({ ref->surface, releaseValue, false });
+    }
 
     delete ref;
     delete owner;
@@ -79,6 +101,24 @@ VkFormat toVkFormat(PyroWavePlaneFormat format)
         return VK_FORMAT_R8_UNORM;
     }
 }
+
+#ifndef _WIN32
+// Granite finds its own Vulkan loader by bare library name, which may miss a
+// copy bundled with the app. Point it at the library SDL loads instead.
+void useSdlVulkanLibrary()
+{
+    if (getenv("GRANITE_VULKAN_LIBRARY") != nullptr || SDL_Vulkan_LoadLibrary(nullptr) != 0) {
+        return;
+    }
+
+    Dl_info info;
+    void* getInstanceProcAddr = SDL_Vulkan_GetVkGetInstanceProcAddr();
+    if (getInstanceProcAddr != nullptr && dladdr(getInstanceProcAddr, &info) && info.dli_fname != nullptr) {
+        setenv("GRANITE_VULKAN_LIBRARY", info.dli_fname, 0);
+    }
+    SDL_Vulkan_UnloadLibrary();
+}
+#endif
 
 const char* resultString(pyrowave_result result)
 {
@@ -296,6 +336,9 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
         result = pyrowave_create_device(vulkanSurfaces->pyroWaveDeviceInfo(), &impl->device);
     }
     else {
+#ifndef _WIN32
+        useSdlVulkanLibrary();
+#endif
         result = pyrowave_create_default_device(&impl->device);
     }
     if (result != PYROWAVE_SUCCESS) {
@@ -336,7 +379,7 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
             if (!impl->importSurface(pool, i)) {
                 return false;
             }
-            impl->freeList->push(i, 0);
+            impl->freeList->push({ i, 0, false });
         }
     }
     else if (vulkanSurfaces != nullptr) {
@@ -346,7 +389,7 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
             uint64_t holdValue;
             vulkanSurfaces->pyroWaveSurface(i, &surface.buffers, &surface.holdSemaphore, &holdValue);
             impl->surfaces.push_back(surface);
-            impl->freeList->push(i, holdValue);
+            impl->freeList->push({ i, holdValue, false });
         }
     }
 
@@ -428,7 +471,7 @@ bool PyroWaveDecoder::decodeToMemory(AVFrame* frame)
 {
     Impl& impl = *m_Impl;
 
-    // ponytail: a fresh allocation per frame; switch to an AVBufferPool if it shows up in profiles
+    // A fresh allocation per frame; an AVBufferPool would avoid it if that shows in profiles
     if (av_frame_get_buffer(frame, 0) < 0) {
         m_LastError = "out of memory";
         return false;
@@ -459,13 +502,13 @@ bool PyroWaveDecoder::decodeToSurface(AVFrame* frame)
 {
     Impl& impl = *m_Impl;
 
-    int surface;
-    uint64_t releaseValue;
-    if (!impl.freeList->pop(surface, releaseValue)) {
+    FreeSurface entry;
+    if (!impl.freeList->pop(entry)) {
         m_LastError = "no free output surface";
         return false;
     }
 
+    const int surface = entry.surface;
     const Impl::Surface& target = impl.surfaces[surface];
 
     // Imported images change ownership around the decode; planes on the
@@ -484,10 +527,10 @@ bool PyroWaveDecoder::decodeToSurface(AVFrame* frame)
         acquire.images = acquireImages.data();
         acquire.num_images = acquireImages.size();
     }
-    if (releaseValue != 0) {
-        // Wait on the GPU until the renderer finished its last read
-        acquire.sync.semaphore = target.holdSemaphore;
-        acquire.sync.value = releaseValue;
+    if (entry.waitValue != 0) {
+        // Wait on the GPU for the renderer's last read, or the last write
+        acquire.sync.semaphore = entry.waitForDecode ? impl.decodeSemaphore : target.holdSemaphore;
+        acquire.sync.value = entry.waitValue;
     }
 
     const uint64_t decodeValue = impl.decodeValue + 1;
@@ -502,7 +545,7 @@ bool PyroWaveDecoder::decodeToSurface(AVFrame* frame)
     const pyrowave_result result = pyrowave_decoder_decode_gpu_buffer(
         impl.decoder, &acquire, &release, &target.buffers);
     if (result != PYROWAVE_SUCCESS) {
-        impl.freeList->push(surface, releaseValue);
+        impl.freeList->push(entry);
         m_LastError = std::string("decode submission failed: ") + resultString(result);
         return false;
     }
@@ -516,9 +559,8 @@ bool PyroWaveDecoder::decodeToSurface(AVFrame* frame)
     frame->buf[0] = av_buffer_create(reinterpret_cast<uint8_t*>(ref), sizeof(*ref),
                                      freeFrameRef, owner, 0);
     if (frame->buf[0] == nullptr) {
-        // The GPU will still write this surface; the release value it needs
-        // is unchanged because nobody sampled it.
-        impl.freeList->push(surface, releaseValue);
+        // The GPU will still write this surface
+        impl.freeList->push({ surface, decodeValue, true });
         delete ref;
         delete owner;
         m_LastError = "out of memory";

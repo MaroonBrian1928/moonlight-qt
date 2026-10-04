@@ -52,6 +52,9 @@ public:
 // that makes it safe to overwrite.
 struct PyroWaveFrameRef {
     static constexpr uint32_t k_Magic = 0x50595257; // "PYRW"
+    // Release value of a surface the renderer could not hand back; the
+    // decoder never reuses it.
+    static constexpr uint64_t k_Quarantined = UINT64_MAX;
 
     uint32_t magic = k_Magic;
     int surface = -1;

@@ -34,9 +34,13 @@ device feature, owns ten surfaces of three storage+sampled plane textures, and
 keeps them held (`pl_vulkan_hold_ex`) for the decoder between renders. Mapping
 a frame releases its planes behind the decode timeline semaphore; unmapping
 holds them again and signals the surface's hold semaphore, which the next
-decode into that surface waits for. PyroWave submits to libplacebo's first
-graphics queue under libplacebo's queue lock. If the libplacebo renderer is
-unavailable, `decodeToMemory()` reads 8-bit frames back for the SDL renderer.
+decode into that surface waits for; a frame dropped unsampled makes the next
+decode into its surface wait for its decode instead, and a surface whose
+planes cannot be held again is retired and the renderer reset. PyroWave
+submits to libplacebo's first graphics queue while holding all of libplacebo's
+queue locks. `initializePyroWave()` tries each renderer with the shared device
+first, then with `decodeToMemory()` (8-bit readback, Granite pointed at SDL's
+Vulkan library); an explicit Metal/AVSBDL renderer choice skips libplacebo.
 
 Balanced readiness floor (2026-09-24), based on `fae3eefe`: the interval-quality
 score averages absolute interval error over one second, which dilutes an

@@ -7,7 +7,7 @@
 #include <libplacebo/vulkan.h>
 
 #include <array>
-#include <memory>
+#include <utility>
 #include <vector>
 
 // libplacebo side of the PyroWave same-device surfaces: plane textures on the
@@ -32,12 +32,13 @@ public:
     ~PlVkPyroWaveSurfaces();
 
     // Builds the libplacebo frame for a decoded surface. Each successful map
-    // must be paired with unmap() once the reads are recorded.
+    // must be paired with unmap() once the reads are recorded. If unmap()
+    // fails, the surface is quarantined and the renderer must be recreated.
     bool map(const AVFrame* frame, const PyroWaveFrameRef* ref, pl_frame* mappedFrame);
-    void unmap(PyroWaveFrameRef* ref);
+    bool unmap(PyroWaveFrameRef* ref);
 
-    // CPU wait for the frame's decode, in microseconds.
-    uint64_t waitForDecode(const PyroWaveFrameRef* ref);
+    // CPU wait for the frame's decode. Returns false on timeout or device loss.
+    bool waitForDecode(const PyroWaveFrameRef* ref, uint64_t* waitUs);
 
     // IPyroWaveVulkanSurfaces
     const pyrowave_device_create_info* pyroWaveDeviceInfo() override { return &m_DeviceInfo; }
@@ -56,7 +57,12 @@ private:
         uint64_t holdValue = 0;
     };
 
+    void lockQueues();
+    void unlockQueues();
+
     pl_vulkan m_Vulkan = nullptr;
+    // Every queue libplacebo uses, as (family, index)
+    std::vector<std::pair<uint32_t, uint32_t>> m_Queues;
     std::vector<Surface> m_Surfaces;
     VkSemaphore m_DecodeSemaphore = VK_NULL_HANDLE;
     PFN_vkWaitSemaphores m_WaitSemaphores = nullptr;
