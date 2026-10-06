@@ -16,3 +16,11 @@ win32:contains(QT_ARCH, x86_64) {
     d3d11.file = $$PWD/d3d11.pro
     SUBDIRS += d3d11
 }
+
+macx {
+    # The client's native Metal decoder against the source and the Vulkan
+    # decoder. Needs an Apple7+ GPU at runtime.
+    pyrowavemetal.file = $$PWD/pyrowavemetallib.pro
+    metal.file = $$PWD/metal.pro
+    SUBDIRS += pyrowavemetal metal
+}

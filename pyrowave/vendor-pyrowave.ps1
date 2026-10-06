@@ -55,9 +55,10 @@ if (Test-Path $Destination) {
 }
 New-Item -ItemType Directory -Force $Destination | Out-Null
 
-# PyroWave: the library, its C API, the checked-in SPIR-V, the bitstream spec and
-# the upstream C API / interop tests. Development tools, evaluation data, the
-# Metal port and sample assets are dropped.
+# PyroWave: the library, its C API, the checked-in SPIR-V, the bitstream spec,
+# the upstream C API / interop tests and the native Metal port (macOS decode on
+# Apple Silicon, built by pyrowave-metal/). Development tools, evaluation data,
+# the Metal Xcode project and sample assets are dropped.
 $pyroKeep = @(
     "CMakeLists.txt", "LICENSE", "README.md", "checkout_granite.sh", "slangmosh.sh",
     "link.T", "pyrowave-shared.def", "pyrowave.h", "pyrowave_c.cpp",
@@ -70,9 +71,10 @@ $pyroKeep = @(
 foreach ($item in $pyroKeep) {
     Copy-Item (Join-Path $pyroSrc $item) (Join-Path $Destination $item)
 }
-foreach ($dir in @("bitstream", "shaders", "pkg-config")) {
+foreach ($dir in @("bitstream", "shaders", "pkg-config", "metal")) {
     Copy-Item -Recurse (Join-Path $pyroSrc $dir) (Join-Path $Destination $dir)
 }
+Remove-Item -Recurse -Force (Join-Path $Destination "metal\pyrowave.xcodeproj")
 New-Item -ItemType Directory -Force (Join-Path $Destination "eval-results") | Out-Null
 Copy-Item (Join-Path $pyroSrc "eval-results\pyrowave_regression_results.h") (Join-Path $Destination "eval-results")
 

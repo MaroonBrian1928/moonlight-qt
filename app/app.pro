@@ -551,6 +551,22 @@ pyrowave {
     else:win32:CONFIG(debug, debug|release): LIBS += -L$$OUT_PWD/../pyrowave/debug/ -lpyrowave
     else:unix: LIBS += -L$$OUT_PWD/../pyrowave/ -lpyrowave
     win32: LIBS += -luser32
+
+    # On Apple Silicon the native Metal port decodes into the Metal renderer's
+    # textures; the Vulkan (MoltenVK) path remains the fallback
+    macx {
+        DEFINES += HAVE_PYROWAVE_METAL
+        SOURCES += streaming/video/pyrowave/pyrowavemetaldecoder.mm
+        HEADERS += \
+            streaming/video/pyrowave/pyrowaveframedecoder.h \
+            streaming/video/pyrowave/pyrowavemetaldecoder.h \
+            streaming/video/pyrowave/pyrowavemetaltarget.h
+        INCLUDEPATH += $$PWD/../pyrowave-metal
+        LIBS += -L$$OUT_PWD/../pyrowave-metal/ -lpyrowave-metal -framework IOSurface
+    }
+    else {
+        HEADERS += streaming/video/pyrowave/pyrowaveframedecoder.h
+    }
 }
 
 RESOURCES += \

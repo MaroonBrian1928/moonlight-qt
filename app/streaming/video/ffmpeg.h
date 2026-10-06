@@ -17,7 +17,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 }
 
-class PyroWaveDecoder;
+class IPyroWaveFrameDecoder;
 
 class FFmpegVideoDecoder : public IVideoDecoder {
 public:
@@ -111,8 +111,9 @@ private:
 
     void reset();
 
-    // PyroWave frames skip FFmpeg: a Vulkan decoder writes into surfaces owned
-    // by the renderer, and these two calls stand in for avcodec send/receive.
+    // PyroWave frames skip FFmpeg: a Vulkan or (macOS) native Metal decoder
+    // writes into surfaces the renderer samples, and these two calls stand in
+    // for avcodec send/receive.
     bool initializePyroWave(PDECODER_PARAMETERS params);
     int sendPyroWaveFrame(int length);
     int receiveFrame(AVFrame* frame);
@@ -166,7 +167,7 @@ private:
     QQueue<uint64_t> m_FrameSubmitTimeQueue;
 
 #ifdef HAVE_PYROWAVE
-    std::unique_ptr<PyroWaveDecoder> m_PyroWave;
+    std::unique_ptr<IPyroWaveFrameDecoder> m_PyroWave;
 #endif
     bool m_PyroWaveActive = false;
     QQueue<AVFrame*> m_PyroWaveOutput;

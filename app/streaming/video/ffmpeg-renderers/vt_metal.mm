@@ -11,6 +11,10 @@
 #include "streaming/streamutils.h"
 #include "path.h"
 
+#ifdef HAVE_PYROWAVE_METAL
+#include "streaming/video/pyrowave/pyrowavemetaltarget.h"
+#endif
+
 #import <Cocoa/Cocoa.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <AVFoundation/AVFoundation.h>
@@ -52,6 +56,9 @@ class VTMetalRenderer;
 @end
 
 class VTMetalRenderer : public VTBaseRenderer
+#ifdef HAVE_PYROWAVE_METAL
+                      , public IPyroWaveMetalTarget
+#endif
 {
 public:
     VTMetalRenderer(bool hwAccel)
@@ -207,6 +214,12 @@ public:
             // VideoToolbox frames never require scaling
             return 1;
         }
+#ifdef HAVE_PYROWAVE_METAL
+        else if (PyroWaveMetalFrameRef::fromFrame(frame) != nullptr) {
+            // PyroWave writes full-range 16-bit samples, not 10 bits in the low bits
+            return 1;
+        }
+#endif
         else {
             const AVPixFmtDescriptor* formatDesc = av_pix_fmt_desc_get((AVPixelFormat)frame->format);
             if (!formatDesc) {
@@ -508,6 +521,15 @@ public:
                 }
             }];
         }
+#ifdef HAVE_PYROWAVE_METAL
+        else if (auto pyroWaveRef = PyroWaveMetalFrameRef::fromFrame(frame)) {
+            // Decoded on our queue ahead of this command buffer, so Metal orders
+            // the reads after the decode
+            for (size_t i = 0; i < planes; i++) {
+                [renderEncoder setFragmentTexture:(id<MTLTexture>)pyroWaveRef->planes[i] atIndex:i];
+            }
+        }
+#endif
         else {
             for (size_t i = 0; i < planes; i++) {
                 [renderEncoder setFragmentTexture:mapPlaneForSoftwareFrame(frame, i) atIndex:i];
@@ -862,6 +884,35 @@ public:
         // Metal supports HDR output
         return RENDERER_ATTRIBUTE_HDR_SUPPORT;
     }
+
+#ifdef HAVE_PYROWAVE_METAL
+    int getFrameBitsPerChannel(const AVFrame* frame) override
+    {
+        // The CSC offsets and range must match the 16-bit samples, as the
+        // Vulkan path tells libplacebo (PlVkPyroWaveSurfaces::map)
+        if (PyroWaveMetalFrameRef::fromFrame(frame) != nullptr &&
+                VTBaseRenderer::getFrameBitsPerChannel(frame) > 8) {
+            return 16;
+        }
+        return VTBaseRenderer::getFrameBitsPerChannel(frame);
+    }
+
+    IPyroWaveMetalTarget* getPyroWaveMetalTarget() override
+    {
+        return m_CommandQueue != nullptr ? this : nullptr;
+    }
+
+    void* pyroWaveMetalDevice() override
+    {
+        return m_CommandQueue.device;
+    }
+
+    void* pyroWaveMetalCommandQueue() override
+    {
+        // The decode and render share it, which orders them (see IPyroWaveMetalTarget)
+        return m_CommandQueue;
+    }
+#endif
 
     bool isPixelFormatSupported(int videoFormat, AVPixelFormat pixelFormat) override
     {

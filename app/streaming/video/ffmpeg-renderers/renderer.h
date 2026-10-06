@@ -140,6 +140,7 @@ private:
 class IVrrFramePresenter;
 class IPyroWaveSurfacePool;
 class IPyroWaveVulkanSurfaces;
+class IPyroWaveMetalTarget;
 
 class GpuTrace;
 class IFFmpegRenderer : public Overlay::IOverlayRenderer {
@@ -284,6 +285,12 @@ public:
         return nullptr;
     }
 
+    // Metal renderers lend the native Metal PyroWave decoder their device and
+    // command queue, and sample the textures it decodes into.
+    virtual IPyroWaveMetalTarget* getPyroWaveMetalTarget() {
+        return nullptr;
+    }
+
     virtual bool isDirectRenderingSupported() {
         // The renderer can render directly to the display
         return true;
@@ -375,7 +382,9 @@ public:
         }
     }
 
-    int getFrameBitsPerChannel(const AVFrame* frame) {
+    // Overridden by renderers that sample some frames at a depth other than
+    // their format's (PyroWave writes full-range 16-bit samples)
+    virtual int getFrameBitsPerChannel(const AVFrame* frame) {
         const AVPixFmtDescriptor* formatDesc = av_pix_fmt_desc_get(getFrameSwPixelFormat(frame));
         if (!formatDesc) {
             // This shouldn't be possible but handle it anyway

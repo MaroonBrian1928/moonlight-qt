@@ -1,0 +1,65 @@
+#pragma once
+
+// Renames the native Metal port's API and internals so it links into the same
+// binary as the Vulkan library. Both define the same C API (pyrowave_decoder_create
+// and friends), the same pyrowave_*_opaque structs and C++ code in namespace
+// PyroWave; without this the linker would reject the duplicates, or silently
+// merge inline functions that differ. Every Metal translation unit, in this
+// library (pyrowave_metal_*.mm/.cpp) and in the client, includes this before
+// pyrowave_metal.h. Nothing may include both pyrowave.h and pyrowave_metal.h.
+//
+// The list is every pyrowave_* identifier pyrowave_metal.h declares, plus the
+// opaque structs it forward-declares. When re-vendoring, regenerate it with
+//   grep -oE '\bpyrowave_[a-z0-9_]+\b' pyrowave/pyrowave/metal/pyrowave_metal.h | sort -u
+// and check `nm -gU` of the built objects: every symbol other than identical
+// std:: template instances must contain "metal" or "Metal".
+
+#define PyroWave PyroWaveMetal
+
+#define pyrowave_chroma_subsampling pyrowave_metal_chroma_subsampling
+#define pyrowave_cpu_buffer pyrowave_metal_cpu_buffer
+#define pyrowave_cpu_buffer_format pyrowave_metal_cpu_buffer_format
+#define pyrowave_create_default_device pyrowave_metal_create_default_device
+#define pyrowave_decoder pyrowave_metal_decoder
+#define pyrowave_decoder_clear pyrowave_metal_decoder_clear
+#define pyrowave_decoder_create pyrowave_metal_decoder_create
+#define pyrowave_decoder_create_info pyrowave_metal_decoder_create_info
+#define pyrowave_decoder_decode_gpu_buffer pyrowave_metal_decoder_decode_gpu_buffer
+#define pyrowave_decoder_decode_is_ready pyrowave_metal_decoder_decode_is_ready
+#define pyrowave_decoder_decode_is_ready_with_sideband pyrowave_metal_decoder_decode_is_ready_with_sideband
+#define pyrowave_decoder_destroy pyrowave_metal_decoder_destroy
+#define pyrowave_decoder_opaque pyrowave_metal_decoder_opaque
+#define pyrowave_decoder_push_packet pyrowave_metal_decoder_push_packet
+#define pyrowave_device pyrowave_metal_device
+#define pyrowave_device_create pyrowave_metal_device_create
+#define pyrowave_device_create_info pyrowave_metal_device_create_info
+#define pyrowave_device_destroy pyrowave_metal_device_destroy
+#define pyrowave_device_is_supported pyrowave_metal_device_is_supported
+#define pyrowave_device_opaque pyrowave_metal_device_opaque
+#define pyrowave_encoder pyrowave_metal_encoder
+#define pyrowave_encoder_compute_block_active_words pyrowave_metal_encoder_compute_block_active_words
+#define pyrowave_encoder_compute_num_critical_packets pyrowave_metal_encoder_compute_num_critical_packets
+#define pyrowave_encoder_compute_num_packets pyrowave_metal_encoder_compute_num_packets
+#define pyrowave_encoder_compute_num_packets_with_padding pyrowave_metal_encoder_compute_num_packets_with_padding
+#define pyrowave_encoder_create pyrowave_metal_encoder_create
+#define pyrowave_encoder_create_info pyrowave_metal_encoder_create_info
+#define pyrowave_encoder_destroy pyrowave_metal_encoder_destroy
+#define pyrowave_encoder_encode_cpu_synchronous pyrowave_metal_encoder_encode_cpu_synchronous
+#define pyrowave_encoder_encode_gpu_synchronous pyrowave_metal_encoder_encode_gpu_synchronous
+#define pyrowave_encoder_get_mapped_raw_bitstream pyrowave_metal_encoder_get_mapped_raw_bitstream
+#define pyrowave_encoder_get_num_active_blocks pyrowave_metal_encoder_get_num_active_blocks
+#define pyrowave_encoder_opaque pyrowave_metal_encoder_opaque
+#define pyrowave_encoder_packetize pyrowave_metal_encoder_packetize
+#define pyrowave_encoder_packetize_with_padding pyrowave_metal_encoder_packetize_with_padding
+#define pyrowave_get_api_version pyrowave_metal_get_api_version
+#define pyrowave_gpu_buffers pyrowave_metal_gpu_buffers
+#define pyrowave_gpu_input pyrowave_metal_gpu_input
+#define pyrowave_iosurface pyrowave_metal_iosurface
+#define pyrowave_message_cb pyrowave_metal_message_cb
+#define pyrowave_mtl_command_buffer pyrowave_metal_mtl_command_buffer
+#define pyrowave_mtl_device pyrowave_metal_mtl_device
+#define pyrowave_mtl_texture pyrowave_metal_mtl_texture
+#define pyrowave_packet pyrowave_metal_packet
+#define pyrowave_rate_control pyrowave_metal_rate_control
+#define pyrowave_result pyrowave_metal_result
+#define pyrowave_result_to_string pyrowave_metal_result_to_string

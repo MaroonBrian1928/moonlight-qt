@@ -1,0 +1,28 @@
+Reject blocks shorter than their header in the Metal BitstreamParser::push_packet.
+
+The Metal port's parser has the same hole patch 0003 closes in the Vulkan
+decoder: a duplicate block_index with payload_words == 0 returns early from
+decode_packet() and the parse cursor never advances, so hostile or corrupted
+network input spins the decoder forever.
+
+diff --git a/metal/pyrowave_bitstream.cpp b/metal/pyrowave_bitstream.cpp
+index 27b9500..819816e 100644
+--- a/metal/pyrowave_bitstream.cpp
++++ b/metal/pyrowave_bitstream.cpp
+@@ -203,6 +203,16 @@ bool BitstreamParser::push_packet(const void *data_, size_t size)
+ 
+ 		size_t packet_size = header->payload_words * sizeof(uint32_t);
+ 
++		// A block is at least its own header. Without this check a duplicate
++		// block_index with payload_words == 0 passes decode_packet()'s duplicate
++		// early-out and the cursor never advances, spinning the decoder forever
++		// on network input (the same hole patch 0003 closes in the Vulkan decoder).
++		if (header->payload_words < sizeof(*header) / sizeof(uint32_t))
++		{
++			PYROWAVE_LOGE("payload_words (%u) is smaller than the block header.\n", unsigned(header->payload_words));
++			return false;
++		}
++
+ 		if (packet_size > size)
+ 		{
+ 			PYROWAVE_LOGE("Packet header states %zu bytes, but only %zu bytes left to parse.\n", packet_size, size);

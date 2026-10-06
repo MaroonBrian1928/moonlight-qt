@@ -42,6 +42,30 @@ queue locks. `initializePyroWave()` tries each renderer with the shared device
 first, then with `decodeToMemory()` (8-bit readback, Granite pointed at SDL's
 Vulkan library); an explicit Metal/AVSBDL renderer choice skips libplacebo.
 
+Native Metal PyroWave decode (2026-10-05, `pyrowave-metal` branch): on Apple7+
+GPUs `initializePyroWave()` first tries `VTMetalRenderer` (software mode) with a
+`PyroWaveMetalDecoder`, which runs PyroWave's upstream Metal port (vendored at the
+same commit, `pyrowave/pyrowave/metal`, built by `pyrowave-metal/` with ARC and
+renamed by `pyrowave_metal_names.h` so it links beside the Vulkan library). The
+decoder owns ten surfaces of three R8/R16 private textures on the renderer's
+`MTLDevice` and commits each decode to the renderer's own `MTLCommandQueue`
+(`IPyroWaveMetalTarget`); queue order plus Metal's hazard tracking orders the
+render after its decode and a later decode into a surface after the reads of it,
+so there are no events or per-frame CPU waits, and a freed frame returns its
+surface at once. The port's own upload ring (four slots) makes a decode wait for
+the oldest only when four are still running on the GPU. Frames carry a `PyroWaveMetalFrameRef` (planes retained by the pool, which
+outlives the decoder) and a software planar format; `renderFrameIntoDrawable()`
+binds the planes directly with the triplanar shader, a bitness scale of 1 and,
+for R16 planes, CSC constants computed at 16 bits (`getFrameBitsPerChannel()`),
+since the samples are full-range 16-bit as on the Vulkan path. An explicit Vulkan/AVSBDL renderer, an
+unsupported GPU (Intel/AMD Macs) or `PYROWAVE_BACKEND=vulkan` falls through to the
+MoltenVK path above. Both decoders implement `IPyroWaveFrameDecoder` and apply the
+same framing, partial-frame and readiness rules. Patch 0005 carries the 0003
+short-block fix into the Metal parser. Verified on an M3 Pro by
+`tests/pyrowave/metal.pro` (Metal encoder; Metal decoder against the MoltenVK
+Vulkan decoder within 2 LSB at 720p-3024x1890, 4:2:0/4:4:4, 8/10-bit; single
+payload losses; surface reuse under a queued read); not yet in a live session.
+
 Balanced readiness floor (2026-09-24), based on `fae3eefe`: the interval-quality
 score averages absolute interval error over one second, which dilutes an
 isolated 4 ms late frame ~100x. Capture `20260923-232347-186` (116 FPS Balanced,
