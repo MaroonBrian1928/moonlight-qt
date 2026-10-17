@@ -1,8 +1,10 @@
 #include "pyrowaveframing.h"
+#include "../../../../pyrowave/compression/pyrowavecompression.h"
 
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace PyroWaveFraming {
 
@@ -32,19 +34,25 @@ class SegmentMap
 {
 public:
     explicit SegmentMap(const std::vector<Segment>& segments)
-        : m_Segments(segments)
+        : m_Segments(segments),
+          m_AnyLost(std::any_of(segments.begin(), segments.end(),
+                               [](const Segment& segment) { return segment.lost; }))
     {
     }
 
     bool anyLost() const
     {
-        return std::any_of(m_Segments.begin(), m_Segments.end(),
-                           [](const Segment& segment) { return segment.lost; });
+        return m_AnyLost;
     }
 
     // Whether any byte of [start, end) was lost
     bool lost(size_t start, size_t end) const
     {
+        // Most frames are intact. Avoid a packet lookup for every record in
+        // that case, while retaining the same record validation below.
+        if (!m_AnyLost) {
+            return false;
+        }
         for (size_t i = indexOf(start); i < m_Segments.size() && m_Segments[i].offset < end; i++) {
             if (m_Segments[i].lost) {
                 return true;
@@ -91,12 +99,31 @@ private:
     // Index of the segment holding pos (segments tile the frame)
     size_t indexOf(size_t pos) const
     {
+        if (m_Segments.empty()) {
+            return 0;
+        }
+        // Record traversal moves forward, often looking up the same packet
+        // several times. Advance once per packet rather than binary-searching
+        // the entire map for each record header and payload.
+        if (pos >= m_Segments[m_Index].offset) {
+            while (m_Index + 1 < m_Segments.size() &&
+                    m_Segments[m_Index + 1].offset <= pos) {
+                ++m_Index;
+            }
+            return m_Index;
+        }
         auto it = std::upper_bound(m_Segments.begin(), m_Segments.end(), pos,
                                    [](size_t value, const Segment& segment) { return value < segment.offset; });
-        return it == m_Segments.begin() ? m_Segments.size() : size_t(it - m_Segments.begin()) - 1;
+        if (it == m_Segments.begin()) {
+            return m_Segments.size();
+        }
+        m_Index = size_t(it - m_Segments.begin()) - 1;
+        return m_Index;
     }
 
     const std::vector<Segment>& m_Segments;
+    const bool m_AnyLost;
+    mutable size_t m_Index = 0;
 };
 
 bool checkSequenceHeader(uint32_t word0, uint32_t word1, const StreamGeometry& geometry,
@@ -143,7 +170,7 @@ bool checkSequenceHeader(uint32_t word0, uint32_t word1, const StreamGeometry& g
 // rest of the frame is lost.
 bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segments,
                      bool coarseLevelKnown, const StreamGeometry& geometry, uint32_t maxBlocks,
-                     Frame& frame, std::string& error)
+                     Frame& frame, std::string& error, bool allowCompression)
 {
     const uint32_t coarseBlocks = coarseBlockCount(geometry);
     const size_t payloadSize = segments.payloadSize();
@@ -194,6 +221,54 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
 
             frame.paddingBytes += uint32_t(padBytes);
             skipTo(pos + size_t(padBytes));
+            continue;
+        }
+
+        if (word0 == PyroWaveCompression::kMagic) {
+            if (!allowCompression || !frame.sequenceHeaderSeen) {
+                error = "compressed detail received without negotiation or sequence header";
+                return false;
+            }
+            const uint64_t groupBytes = PyroWaveCompression::kHeaderBytes +
+                                       ((uint64_t(word1) + 3) & ~uint64_t(3));
+            if (groupBytes > size - pos) {
+                error = "compressed detail runs past the frame";
+                return false;
+            }
+            pastCoarseLevel = true;
+            const size_t end = pos + size_t(groupBytes);
+            if (segments.lost(pos, end)) {
+                noteLoss();
+                skipTo(end);
+                continue;
+            }
+            const size_t offset = frame.expanded.size();
+            if (!PyroWaveCompression::expandGroup(data + pos, size_t(groupBytes), frame.expanded, error))
+                return false;
+            uint32_t blocks = 0;
+            for (size_t at = offset; at < frame.expanded.size();) {
+                if (frame.expanded.size() - at < k_HeaderBytes) {
+                    error = "truncated expanded detail record";
+                    return false;
+                }
+                const uint32_t header = readU32(frame.expanded.data() + at);
+                const uint32_t block = readU32(frame.expanded.data() + at + 4) >> 8;
+                const size_t bytes = size_t((header >> 16) & 0xFFFu) * 4;
+                if ((header & 0x80000000u) || ((header >> 28) & 7) != sequence ||
+                    bytes < k_HeaderBytes || bytes > frame.expanded.size() - at ||
+                    block < coarseBlocks || block >= maxBlocks) {
+                    error = "invalid expanded detail geometry, sequence or record";
+                    return false;
+                }
+                ++blocks;
+                at += bytes;
+            }
+            // Flush the native wire span before appending the expanded span.
+            skipTo(pos);
+            frame.spans.push_back({offset, frame.expanded.size() - offset, true});
+            frame.blockRecords += blocks;
+            pos = spanStart = end;
+            aligned = false;
             continue;
         }
 
@@ -252,7 +327,8 @@ bool walkRecordFrame(const uint8_t* data, size_t size, const SegmentMap& segment
         // Only the finer level's ordinary records are packed so that none crosses a
         // packet boundary; its oversized ones come first.
         const bool ordinary = end - pos + k_HeaderBytes <= payloadSize;
-        aligned = ordinary && blockIndex >= coarseBlocks && segments.withinOnePacket(pos, end);
+        aligned = segments.anyLost() && ordinary && blockIndex >= coarseBlocks &&
+                  segments.withinOnePacket(pos, end);
         frame.blockRecords++;
         pos = end;
     }
@@ -360,9 +436,18 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
 }
 
 bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segments,
-           size_t criticalPackets, const StreamGeometry& geometry, Frame& frame, std::string& error)
+           size_t criticalPackets, const StreamGeometry& geometry, Frame& frame, std::string& error,
+           bool allowCompression)
 {
+    // Keep the per-decoder span allocation across frames. All semantic state
+    // is still reset, including after a failed or partial frame.
+    auto spans = std::move(frame.spans);
+    auto expanded = std::move(frame.expanded);
+    spans.clear();
+    expanded.clear();
     frame = Frame();
+    frame.spans = std::move(spans);
+    frame.expanded = std::move(expanded);
 
     if (data == nullptr || size < k_HeaderBytes || (size % 4) != 0) {
         error = "frame is empty or not word aligned";
@@ -407,7 +492,7 @@ bool parse(const uint8_t* data, size_t size, const std::vector<Segment>& segment
                                                    [](const Segment& segment) { return segment.lost; });
         }
 
-        if (!walkRecordFrame(data, size, packets, coarseLevelKnown, geometry, maxBlocks, frame, error)) {
+        if (!walkRecordFrame(data, size, packets, coarseLevelKnown, geometry, maxBlocks, frame, error, allowCompression)) {
             return false;
         }
     }

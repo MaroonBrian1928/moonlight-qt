@@ -1,5 +1,5 @@
 TEMPLATE = app
-TARGET = tst_pyrowavemetal
+TARGET = tst_pyrowavemetaldecoder
 QT -= gui core
 CONFIG += console c++17 warn_off
 CONFIG -= app_bundle
@@ -16,7 +16,7 @@ INCLUDEPATH += \
     $$PWD/../../moonlight-common-c/moonlight-common-c/src
 
 SOURCES += \
-    $$PWD/tst_pyrowavemetal.mm \
+    $$PWD/tst_pyrowavemetaldecoder.mm \
     $$PWD/pyrowavemetalencoder.cpp \
     $$PWD/../../app/streaming/video/pyrowave/pyrowavemetaldecoder.mm \
     $$PWD/../../app/streaming/video/pyrowave/pyrowaveframing.cpp

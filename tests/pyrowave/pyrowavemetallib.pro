@@ -1,4 +1,4 @@
-# PyroWave's native Metal port, built next to tst_pyrowavemetal (metal.pro)
+# PyroWave's native Metal port, built next to tst_pyrowavemetaldecoder (metal.pro)
 TEMPLATE = lib
 TARGET = pyrowave-metal
 QT -= gui core

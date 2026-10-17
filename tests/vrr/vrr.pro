@@ -3,11 +3,18 @@
 TEMPLATE = subdirs
 CONFIG += ordered
 
+macx {
+    macdisplaytiming.file = $$PWD/macdisplaytiming.pro
+    SUBDIRS += macdisplaytiming
+}
+
 dxgipresent.file = $$PWD/dxgipresent.pro
 SUBDIRS += dxgipresent
 
 presentationclock.file = $$PWD/presentationclock.pro
 SUBDIRS += presentationclock
+compositionpresentpolicy.file = $$PWD/compositionpresentpolicy.pro
+SUBDIRS += compositionpresentpolicy
 
 win32 {
     compositionprobe.file = $$PWD/compositionprobe.pro
@@ -36,6 +43,10 @@ d3d11bindpolicy.file = $$PWD/d3d11bindpolicy.pro
 SUBDIRS += d3d11bindpolicy
 gamescopecomposition.file = $$PWD/gamescopecomposition.pro
 SUBDIRS += gamescopecomposition
+linux:packagesExist(sdl2) {
+    gpuperformancehold.file = $$PWD/gpuperformancehold.pro
+    SUBDIRS += gpuperformancehold
+}
 linux:packagesExist(vulkan) {
     vulkantiming.file = $$PWD/vulkantiming.pro
     SUBDIRS += vulkantiming
@@ -45,7 +56,12 @@ unix:!macx:packagesExist(wayland-server sdl2) {
     SUBDIRS += waylandfeedback
 }
 
+preferences.file = $$PWD/preferences.pro
+SUBDIRS += preferences
+
 timingcontroller.file = $$PWD/timingcontroller.pro
+sourcegapsmoothing.file = $$PWD/sourcegapsmoothing.pro
+SUBDIRS += sourcegapsmoothing
 framelimitercapabilities.file = $$PWD/framelimitercapabilities.pro
 ratepolicy.file = $$PWD/ratepolicy.pro
 diagnostics.file = $$PWD/diagnostics.pro
@@ -72,4 +88,18 @@ SUBDIRS += profile
 linux:packagesExist(wayland-client wayland-server) {
     gamescoperepaint.file = $$PWD/gamescoperepaint.pro
     SUBDIRS += gamescoperepaint
+    kwinscanoutguard.file = $$PWD/kwinscanoutguard.pro
+    SUBDIRS += kwinscanoutguard
 }
+
+phasetrajectory.file = $$PWD/phasetrajectory.pro
+SUBDIRS += phasetrajectory
+inputpercentileintegration.file = $$PWD/inputpercentileintegration.pro
+SUBDIRS += inputpercentileintegration
+
+performancestats.file = $$PWD/performancestats.pro
+SUBDIRS += performancestats
+
+# Clock-relative history and bounded recovery credit regression.
+SUBDIRS += inputaccounting
+inputaccounting.file = $$PWD/inputaccounting.pro

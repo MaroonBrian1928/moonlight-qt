@@ -11,6 +11,7 @@
 #import <Metal/Metal.h>
 
 #include <array>
+#include <chrono>
 #include <deque>
 #include <mutex>
 
@@ -71,6 +72,36 @@ void freeFrameRef(void* opaque, uint8_t* data)
     delete ref;
     delete owner;
 }
+
+// Fills the same phases as PyroWaveDecoder's timer: parse, push/validate,
+// acquire, submit (encode and commit), release (frame reference)
+class DecodePhaseTimer {
+public:
+    explicit DecodePhaseTimer(PyroWaveDecodeDiagnostics* diagnostics)
+        : m_Diagnostics(diagnostics)
+    {
+        if (m_Diagnostics) {
+            *m_Diagnostics = {};
+            m_Start = Clock::now();
+        }
+    }
+    ~DecodePhaseTimer() { finish(); }
+    void next(unsigned phase) { finish(); m_Phase = phase; }
+private:
+    using Clock = std::chrono::steady_clock;
+    void finish()
+    {
+        if (m_Diagnostics) {
+            const auto now = Clock::now();
+            m_Diagnostics->phaseUs[m_Phase] +=
+                std::chrono::duration_cast<std::chrono::microseconds>(now - m_Start).count();
+            m_Start = now;
+        }
+    }
+    PyroWaveDecodeDiagnostics* m_Diagnostics;
+    unsigned m_Phase = 0;
+    Clock::time_point m_Start;
+};
 
 void logMessage(void*, const char* message)
 {
@@ -222,20 +253,31 @@ bool PyroWaveMetalDecoder::initialize(const Config& config, IPyroWaveMetalTarget
 
 bool PyroWaveMetalDecoder::decode(const uint8_t* data, size_t size,
                                   const std::vector<PyroWaveFraming::Segment>& packets, size_t criticalPackets,
-                                  AVFrame* frame)
+                                  AVFrame* frame, DecodeDiagnostics* diagnostics)
 { @autoreleasepool {
     Impl& impl = *m_Impl;
+    DecodePhaseTimer phase(diagnostics);
 
     m_LastFramePartial = false;
+    // The Metal port is not given LZ4-compressed detail groups
     if (!PyroWaveFraming::parse(data, size, packets, criticalPackets, impl.geometry, impl.parsed, m_LastError)) {
         return false;
     }
+    if (diagnostics) {
+        diagnostics->receivedBlocks = impl.parsed.blockRecords;
+        diagnostics->announcedBlocks = impl.parsed.announcedBlocks;
+        diagnostics->paddingBytes = impl.parsed.paddingBytes;
+        diagnostics->partial = impl.parsed.partial;
+        for (const auto& span : impl.parsed.spans) diagnostics->payloadBytes += span.size;
+    }
+    phase.next(1);
 
     // Every frame is independent. Clearing first keeps the 3-bit sequence
     // counter from treating a frame after a long drop as stale.
     pyrowave_decoder_clear(impl.decoder);
     for (const auto& span : impl.parsed.spans) {
-        const pyrowave_result result = pyrowave_decoder_push_packet(impl.decoder, data + span.offset, span.size);
+        const pyrowave_result result = pyrowave_decoder_push_packet(
+            impl.decoder, (span.expanded ? impl.parsed.expanded.data() : data) + span.offset, span.size);
         if (result != PYROWAVE_SUCCESS) {
             m_LastError = std::string("decoder rejected a packet: ") + pyrowave_result_to_string(result);
             return false;
@@ -249,20 +291,21 @@ bool PyroWaveMetalDecoder::decode(const uint8_t* data, size_t size,
         }
     }
     else {
-        // As in PyroWaveDecoder: a partial frame decodes if its coarsest
-        // wavelet level is intact (checked by the parser) and more than 90% of
-        // its blocks arrived; missing detail decodes as blur.
+        // As in PyroWaveDecoder: a partial frame decodes whenever its
+        // coarsest wavelet level is intact (checked by the parser); missing
+        // detail decodes as blur.
         if (!impl.parsed.coarseLevelIntact) {
             m_LastError = "part of the coarsest wavelet level was lost";
             return false;
         }
-        if (!pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.9f, nullptr, 0)) {
-            m_LastError = "too little of the frame arrived (" + std::to_string(impl.parsed.blockRecords) +
+        if (!pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.0f, nullptr, 0)) {
+            m_LastError = "no decodable blocks arrived (" + std::to_string(impl.parsed.blockRecords) +
                           " of " + std::to_string(impl.parsed.announcedBlocks) + " blocks)";
             return false;
         }
     }
     m_LastFramePartial = impl.parsed.partial;
+    phase.next(2);
 
     int surface;
     if (!impl.pool->pop(surface)) {
@@ -282,6 +325,7 @@ bool PyroWaveMetalDecoder::decode(const uint8_t* data, size_t size,
     for (int plane = 0; plane < 3; plane++) {
         buffers.planes[plane] = impl.pool->planes[surface][plane];
     }
+    phase.next(3);
     const pyrowave_result result = pyrowave_decoder_decode_gpu_buffer(impl.decoder, commandBuffer, &buffers);
     if (result != PYROWAVE_SUCCESS) {
         // Nothing was committed
@@ -290,15 +334,15 @@ bool PyroWaveMetalDecoder::decode(const uint8_t* data, size_t size,
         return false;
     }
     [commandBuffer commit];
+    phase.next(4);
 
+    // R16Unorm planes span the full 16-bit range, which is how FFmpeg's
+    // 16-bit formats are normalized (as PyroWaveMetalPool tags its frames)
     frame->width = impl.config.width;
     frame->height = impl.config.height;
-    if (impl.config.tenBit) {
-        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV420P10;
-    }
-    else {
-        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
-    }
+    frame->format = impl.config.tenBit ?
+        (impl.config.chroma444 ? AV_PIX_FMT_YUV444P16 : AV_PIX_FMT_YUV420P16) :
+        (impl.config.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P);
     // Hosts average each 2x2 quad for 4:2:0 chroma
     frame->chroma_location = AVCHROMA_LOC_CENTER;
     frame->flags |= AV_FRAME_FLAG_KEY;

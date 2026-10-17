@@ -8,10 +8,10 @@
 #include "../bandwidth.h"
 #include "decoder.h"
 #include "incomingframetiming.h"
-#include "clientpacingwarning.h"
 #include "ffmpeg-renderers/renderer.h"
 #include "ffmpeg-renderers/pacer/pacer.h"
 #include "pyrowave/pyrowaveframing.h"
+#include "pyrowave/pyrowavepacketlosswarning.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -63,7 +63,7 @@ private:
 
     bool finishRenderInitialization(PDECODER_PARAMETERS params);
 
-    void stringifyVideoStats(VIDEO_STATS& stats, char* output, int length);
+    void stringifyVideoStats(VIDEO_STATS& stats, char* output, int length, bool detailed = false);
 
     void logVideoStats(VIDEO_STATS& stats, const char* title);
 
@@ -115,7 +115,7 @@ private:
     // writes into surfaces the renderer samples, and these two calls stand in
     // for avcodec send/receive.
     bool initializePyroWave(PDECODER_PARAMETERS params);
-    int sendPyroWaveFrame(int length);
+    int sendPyroWaveFrame(int length, uint32_t rtpTimestamp);
     int receiveFrame(AVFrame* frame);
 
     void writeBuffer(PLENTRY entry, int& offset);
@@ -142,8 +142,9 @@ private:
     VIDEO_STATS m_LastWndVideoStats;
     VIDEO_STATS m_GlobalVideoStats;
     PacerTelemetrySnapshot m_LastPacerTelemetry;
-    ClientPacingWarning m_ClientPacingWarning;
-    int m_VrrLatencyMode = 0;
+    PyroWavePacketLossWarning m_PyroWavePacketLossWarning;
+    uint64_t m_LastTimingGraphUs = 0;
+    bool m_VrrUsesMaximumBuffer = false;
     std::set<IFFmpegRenderer::RendererType> m_FailedRenderers;
 
     int m_FramesIn;
@@ -165,6 +166,10 @@ private:
     QQueue<DECODE_UNIT> m_FrameInfoQueue;
     // Parallel to m_FrameInfoQueue: when each packet was handed to the decoder.
     QQueue<uint64_t> m_FrameSubmitTimeQueue;
+    // Parallel to m_FrameSubmitTimeQueue: deliberate hold before submission.
+    QQueue<uint64_t> m_FrameDecodeHoldQueue;
+    // Parallel to m_FrameDecodeHoldQueue: PyroWave packets zero-filled for loss.
+    QQueue<uint32_t> m_FrameLostPacketsQueue;
 
 #ifdef HAVE_PYROWAVE
     std::unique_ptr<IPyroWaveFrameDecoder> m_PyroWave;
@@ -178,6 +183,17 @@ private:
     uint32_t m_PyroWaveRejectedFrames = 0;
     uint32_t m_PyroWavePartialFrames = 0;
     uint64_t m_PyroWaveLastErrorLogUs = 0;
+    uint32_t m_PyroWaveHeldDecodes = 0;
+    uint64_t m_PyroWaveHeldUs = 0;
+    uint32_t m_PyroWaveStaleSkips = 0;
+    // The current run of skipped frames, logged once a frame is decoded again
+    uint32_t m_PyroWaveSkipRun = 0;
+    // Smoothed RTP interval of consecutive frames, the source's actual cadence.
+    uint64_t m_PyroWaveSourcePeriodUs = 0;
+    uint32_t m_PyroWaveLastRtp = 0;
+    int m_PyroWaveLastFrameNumber = -1;
+    uint64_t m_PyroWaveSkipRunWaitUs = 0;
+    uint64_t holdPyroWaveDecodeForPresent(uint32_t rtpTimestamp);
 
     static const uint8_t k_H264TestFrame[];
     static const uint8_t k_HEVCMainTestFrame[];

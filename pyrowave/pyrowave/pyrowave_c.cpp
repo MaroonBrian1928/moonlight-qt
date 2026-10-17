@@ -6,11 +6,14 @@
 #include "image.hpp"
 #include "buffer.hpp"
 #include "pyrowave.h"
+#include "pyrowave_d3d11_interop.hpp"
 #include "pyrowave_decoder.hpp"
 #include "pyrowave_encoder.hpp"
 #include "logging.hpp"
 #include "slangmosh_scaler.hpp"
 #include "scaler.hpp"
+
+#include <chrono>
 
 using namespace Granite;
 using namespace Vulkan;
@@ -349,10 +352,8 @@ static bool pyrowave_device_confirm_external_memory_support(pyrowave_device devi
 	static const VkExternalMemoryHandleTypeFlagBits required_external_types[] = {
 #ifdef _WIN32
 		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
 		VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT,
 		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT,
-		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT,
 #else
 		VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
 		VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
@@ -399,6 +400,30 @@ static bool pyrowave_device_confirm_external_memory_support(pyrowave_device devi
 	return true;
 }
 
+bool pyrowave_device_confirm_d3d11_interop_support(pyrowave_device device, VkFormat format, const char **reason)
+{
+    const char *failure = "D3D11 interop requires Windows";
+#ifdef _WIN32
+    if (!device) failure = "missing Vulkan device";
+    else if (!vkGetPhysicalDeviceExternalSemaphoreProperties || !vkGetPhysicalDeviceImageFormatProperties2)
+        failure = "external image/semaphore query unavailable";
+    else failure = PyroWave::checkD3D11Interop(format,
+        device->device.get_device_features().supports_external,
+        [&](VkFormat f, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage,
+            VkImageCreateFlags flags, const VkPhysicalDeviceExternalImageFormatInfo *external,
+            VkImageFormatProperties2 *properties) {
+            return device->device.get_image_format_properties(f, type, tiling, usage, flags, external, properties);
+        },
+        [&](const VkPhysicalDeviceExternalSemaphoreInfo *info, VkExternalSemaphoreProperties *properties) {
+            vkGetPhysicalDeviceExternalSemaphoreProperties(device->device.get_physical_device(), info, properties);
+        });
+#else
+    (void)device; (void)format;
+#endif
+    if (reason) *reason = failure;
+    return failure == nullptr;
+}
+
 bool pyrowave_device_confirm_interop_support(pyrowave_device device)
 {
 	Util::set_thread_logging_interface(&null_logger);
@@ -420,6 +445,15 @@ pyrowave_device_set_queue_type(pyrowave_device device, VkQueueFlagBits queue_fla
 	if (queue_flags != VK_QUEUE_GRAPHICS_BIT && queue_flags != VK_QUEUE_COMPUTE_BIT)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 	device->queue_type = queue_flags == VK_QUEUE_GRAPHICS_BIT ? CommandBuffer::Type::Generic : CommandBuffer::Type::AsyncCompute;
+	return PYROWAVE_SUCCESS;
+}
+
+pyrowave_result
+pyrowave_device_set_frame_contexts(pyrowave_device device, unsigned count)
+{
+	if (!device || count < 2 || count > 8)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	device->device.init_frame_contexts(count);
 	return PYROWAVE_SUCCESS;
 }
 
@@ -1532,7 +1566,38 @@ struct pyrowave_decoder_opaque
 	ChromaSubsampling chroma = {};
 	int width = 0;
 	int height = 0;
+	struct CachedOutput
+	{
+		pyrowave_gpu_buffers buffers;
+		WrappedViewBuffers views;
+	};
+	bool cache_output_views = false;
+	std::vector<CachedOutput> output_views;
 };
+
+void pyrowave_decoder_set_output_view_cache(pyrowave_decoder decoder, bool enable)
+{
+	Util::set_thread_logging_interface(&null_logger);
+	decoder->cache_output_views = enable;
+	decoder->output_views.clear();
+	if (enable)
+		decoder->output_views.reserve(16);
+}
+
+static bool same_output_views(const pyrowave_gpu_buffers &a, const pyrowave_gpu_buffers &b)
+{
+	for (unsigned i = 0; i < 3; i++)
+	{
+		const auto &x = a.planes[i];
+		const auto &y = b.planes[i];
+		if (x.image != y.image || x.width != y.width || x.height != y.height ||
+		    x.image_format != y.image_format || x.view_format != y.view_format ||
+		    x.mip_level != y.mip_level || x.layer != y.layer || x.aspect != y.aspect ||
+		    x.swizzle != y.swizzle || x.layout != y.layout)
+			return false;
+	}
+	return true;
+}
 
 bool pyrowave_decoder_device_prefers_fragment_path(pyrowave_device device)
 {
@@ -1603,21 +1668,48 @@ bool pyrowave_decoder_decode_is_ready_with_sideband(pyrowave_decoder decoder, bo
 }
 
 pyrowave_result
-pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
-                                   const pyrowave_gpu_sync_operation *acquire,
-                                   const pyrowave_gpu_sync_operation *release,
-                                   const pyrowave_gpu_buffers *buffers)
+pyrowave_decoder_decode_gpu_buffer_with_context_timing(pyrowave_decoder decoder,
+                                                       const pyrowave_gpu_sync_operation *acquire,
+                                                       const pyrowave_gpu_sync_operation *release,
+                                                       const pyrowave_gpu_buffers *buffers,
+                                                       uint64_t *context_wait_us)
 {
+	if (context_wait_us)
+		*context_wait_us = 0;
 	if (decoder->pyro_device->cmd && (acquire || release))
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
 	Util::set_thread_logging_interface(&null_logger);
 	auto *device = decoder->device;
+	auto before_context = context_wait_us ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 	device->next_frame_context();
+	if (context_wait_us)
+		*context_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+			std::chrono::steady_clock::now() - before_context).count();
 
-	WrappedViewBuffers views = {};
-	if (!views.wrap(device, buffers, decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
-		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	WrappedViewBuffers transient_views = {};
+	const WrappedViewBuffers *views = nullptr;
+	if (decoder->cache_output_views)
+	{
+		for (const auto &cached : decoder->output_views)
+			if (same_output_views(cached.buffers, *buffers))
+			{
+				views = &cached.views;
+				break;
+			}
+	}
+	if (!views)
+	{
+		if (!transient_views.wrap(device, buffers, decoder->fragment_path ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : VK_IMAGE_USAGE_STORAGE_BIT))
+			return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+		if (decoder->cache_output_views && decoder->output_views.size() < 16)
+		{
+			decoder->output_views.push_back({*buffers, std::move(transient_views)});
+			views = &decoder->output_views.back().views;
+		}
+		else
+			views = &transient_views;
+	}
 
 	// Just use normal graphics queue here since the result will likely be consumed there.
 	auto cmd = decoder->pyro_device->cmd
@@ -1651,7 +1743,7 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 		}
 	}
 
-	auto ret = decoder->decoder.decode(*cmd, views);
+	auto ret = decoder->decoder.decode(*cmd, *views);
 	if (!ret)
 	{
 		device->submit_discard(cmd);
@@ -1688,6 +1780,15 @@ pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
 }
 
 pyrowave_result
+pyrowave_decoder_decode_gpu_buffer(pyrowave_decoder decoder,
+                                   const pyrowave_gpu_sync_operation *acquire,
+                                   const pyrowave_gpu_sync_operation *release,
+                                   const pyrowave_gpu_buffers *buffers)
+{
+	return pyrowave_decoder_decode_gpu_buffer_with_context_timing(decoder, acquire, release, buffers, nullptr);
+}
+
+pyrowave_result
 pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const pyrowave_cpu_buffer *buffers)
 {
 	if (decoder->pyro_device->cmd)
@@ -1702,9 +1803,16 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 	if (buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_NV12)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
-	if (decoder->chroma == ChromaSubsampling::Chroma420 && buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P)
+	const bool chroma444 = buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P ||
+	                      buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P16;
+	const bool sixteen_bit = buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV420P16 ||
+	                         buffers->format == PYROWAVE_CPU_BUFFER_FORMAT_YUV444P16;
+	if (decoder->chroma == ChromaSubsampling::Chroma420 && chroma444)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
-	if (decoder->chroma == ChromaSubsampling::Chroma444 && buffers->format != PYROWAVE_CPU_BUFFER_FORMAT_YUV444P)
+	if (decoder->chroma == ChromaSubsampling::Chroma444 && !chroma444)
+		return PYROWAVE_ERROR_INVALID_ARGUMENT;
+	if (buffers->format != PYROWAVE_CPU_BUFFER_FORMAT_YUV420P &&
+	    buffers->format != PYROWAVE_CPU_BUFFER_FORMAT_YUV444P && !sixteen_bit)
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
 
 	for (int plane = 0; plane < 3; plane++)
@@ -1718,9 +1826,11 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 			plane_height /= 2;
 		}
 
-		const size_t plane_bpp = 1;
+		const size_t plane_bpp = sixteen_bit ? 2 : 1;
 
 		if (buffers->row_stride_in_bytes[plane] < plane_width * plane_bpp)
+			return PYROWAVE_ERROR_INVALID_ARGUMENT;
+		if (buffers->row_stride_in_bytes[plane] % plane_bpp != 0)
 			return PYROWAVE_ERROR_INVALID_ARGUMENT;
 		if (buffers->row_stride_in_bytes[plane] * plane_height > buffers->plane_size_in_bytes[plane])
 			return PYROWAVE_ERROR_INVALID_ARGUMENT;
@@ -1732,7 +1842,8 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 
 		if (!img)
 		{
-			auto info = ImageCreateInfo::immutable_2d_image(buffers->width, buffers->height, VK_FORMAT_R8_UNORM);
+			auto info = ImageCreateInfo::immutable_2d_image(buffers->width, buffers->height,
+			                                                  sixteen_bit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM);
 			info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 			if (decoder->fragment_path)
 			{
@@ -1822,7 +1933,7 @@ pyrowave_decoder_decode_cpu_buffer_synchronous(pyrowave_decoder decoder, const p
 
 		cmd->copy_image_to_buffer(*readback_buffers[plane], *decoder->planes[plane], 0, {},
 		                          {decoder->planes[plane]->get_width(), decoder->planes[plane]->get_height(), 1},
-		                          buffers->row_stride_in_bytes[plane], 0,
+		                          buffers->row_stride_in_bytes[plane] / (sixteen_bit ? 2 : 1), 0,
 		                          {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1});
 	}
 

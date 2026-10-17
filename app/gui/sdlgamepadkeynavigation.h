@@ -2,6 +2,11 @@
 
 #include <QTimer>
 #include <QEvent>
+#include <QHash>
+#include <QPair>
+#include <QPointer>
+
+class QWindow;
 
 #include "SDL_compat.h"
 
@@ -27,7 +32,10 @@ public:
     Q_INVOKABLE int getConnectedGamepads();
 
 private:
-    void sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers = Qt::NoModifier);
+    void sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers = Qt::NoModifier,
+                 QWindow* target = nullptr);
+
+    void releaseControllerKeys();
 
     void updateTimerState();
 
@@ -43,4 +51,12 @@ private:
     bool m_FirstPoll;
     bool m_HasFocus;
     Uint32 m_LastAxisNavigationEventTime;
+    // Popups can change navigation mode during a button press. Its release
+    // must still match the key and modifiers sent for that same press.
+    struct ControllerKey {
+        Qt::Key key;
+        Qt::KeyboardModifiers modifiers;
+        QPointer<QWindow> window;
+    };
+    QHash<quint64, ControllerKey> m_PressedControllerKeys;
 };

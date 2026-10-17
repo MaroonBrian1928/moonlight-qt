@@ -9,8 +9,10 @@ class IPyroWaveMetalTarget;
 
 // Decodes PyroWave frames with the native Metal port into a pool of plane
 // textures on a Metal renderer's device (IPyroWaveMetalTarget). Each frame
-// carries a PyroWaveMetalFrameRef. Not thread safe: decode() must be called
-// from one thread. Frames it produces may be freed from any thread.
+// carries a PyroWaveMetalFrameRef. Opt-in (PYROWAVE_BACKEND=metal): the
+// default macOS path is PyroWaveDecoder on MoltenVK through PyroWaveMetalPool.
+// Not thread safe: decode() must be called from one thread. Frames it produces
+// may be freed from any thread.
 class PyroWaveMetalDecoder : public IPyroWaveFrameDecoder
 {
 public:
@@ -28,12 +30,15 @@ public:
 
     bool initialize(const Config& config, IPyroWaveMetalTarget* target);
 
+    // Decodes are committed to the renderer's queue, not waited for
+    bool hasAsynchronousOutput() const override { return true; }
+
     // The decode is committed to the target's queue, not waited for, unless
     // four earlier decodes are still running on the GPU: the port then waits
     // for the oldest before reusing its upload buffers.
     bool decode(const uint8_t* data, size_t size,
                 const std::vector<PyroWaveFraming::Segment>& packets, size_t criticalPackets,
-                AVFrame* frame) override;
+                AVFrame* frame, DecodeDiagnostics* diagnostics = nullptr) override;
 
     const std::string& lastError() const override { return m_LastError; }
 

@@ -10,7 +10,11 @@
 #include "video/decoder.h"
 #include "audio/renderers/renderer.h"
 #include "video/overlaymanager.h"
+#include "video/clientpacingwarning.h"
 #include "diagnostics/diagnosticcapture.h"
+#ifdef HAVE_KWIN_SCANOUT_GUARD
+#include "streaming/kwinscanoutguard.h"
+#endif
 
 class SupportedVideoFormatList : public QList<int>
 {
@@ -126,7 +130,8 @@ public:
         return m_OverlayManager;
     }
 
-    bool clientPacingWarningsEnabled() const { return m_Preferences->connectionWarnings; }
+    bool clientPacingWarningsEnabled() const { return m_Preferences->connectionWarnings && !m_Preferences->hideVrrBufferWarnings; }
+    ClientPacingWarning& clientPacingWarning() { return m_ClientPacingWarning; }
     bool hevcPacingAlternative() const { return m_HevcPacingAlternative; }
 
     int streamColorRange() const
@@ -209,7 +214,9 @@ private:
                        int vrrDisplayRefreshHz = 0,
                        bool* effectiveVrr = nullptr, bool smoothVrrFrameTiming = true,
                        bool gamescopeMailbox = false, int vrrLatencyMode = 0,
-                       bool gamescopeRepaint = false);
+                       bool gamescopeRepaint = false,
+                       VrrTimingOptions vrrTimingOptions = {},
+                       bool absorbVrrMicrostutter = false);
 
     static
     void clStageStarting(int stage);
@@ -269,9 +276,11 @@ private:
         bool enableFramePacing = false;
         bool enableVrr = false;
         int vrrLatencyMode = 0;
+        VrrTimingOptions vrrTimingOptions;
         bool gamescopeMailbox = false;
         bool gamescopeRepaint = false;
         bool smoothVrrFrameTiming = true;
+        bool absorbVrrMicrostutter = false;
         int refreshRate = 0;
         StreamingPreferences::WindowMode effectiveWindowMode = StreamingPreferences::WM_WINDOWED;
         StreamingPreferences::VideoDecoderSelection decoderSelection = StreamingPreferences::VDS_AUTO;
@@ -279,8 +288,12 @@ private:
     };
 
     StreamingPreferences* m_Preferences;
+    ClientPacingWarning m_ClientPacingWarning;
     PresentationSettings m_PresentationSettings;
     std::unique_ptr<DiagnosticCapture> m_DiagnosticCapture;
+#ifdef HAVE_KWIN_SCANOUT_GUARD
+    std::unique_ptr<KWinScanoutGuard> m_ScanoutGuard;
+#endif
     bool m_IsFullScreen;
     bool m_HevcPacingAlternative = false;
     SupportedVideoFormatList m_SupportedVideoFormats; // Sorted in order of descending priority

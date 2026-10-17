@@ -413,6 +413,68 @@ void testPartialFrames()
            "a packet map with a gap is rejected");
 }
 
+void testLongPacketMapAndFrameReuse()
+{
+    const StreamGeometry geometry {3840, 2160, true};
+    constexpr size_t packets = 200;
+    constexpr size_t shard = 256;
+    const uint32_t coarseBlocks = PyroWaveFraming::coarseBlockCount(geometry);
+    std::vector<uint8_t> data;
+    putSequenceHeader(data, geometry.width, geometry.height, packets, true);
+    putBlock(data, 0, 60); // Sequence + record fills the first 248-byte payload
+    for (size_t i = 1; i < packets; ++i) {
+        putBlock(data, coarseBlocks + uint32_t(i), 62);
+        putPadding(data, 0);
+    }
+
+    auto damaged = data;
+    std::vector<size_t> lost;
+    for (size_t i = 7; i < packets; i += 7) lost.push_back(i);
+    auto segments = losePackets(damaged, shard, lost);
+    for (auto& segment : segments) segment.recordStart = true;
+    Frame frame;
+    std::string error;
+    expect(PyroWaveFraming::parse(damaged.data(), damaged.size(), segments, 1, geometry, frame, error),
+           "a long flagged packet map recovers after separated losses");
+    expect(frame.partial && frame.coarseLevelIntact && frame.blockRecords == packets - lost.size(),
+           "long map preserves the critical prefix and counts only surviving records");
+    size_t span = 0;
+    for (size_t i = 0; i < packets; ++i) {
+        if (segments[i].lost) continue;
+        // The first and second records are contiguous; later ones have padding
+        // between them. The first span therefore covers both packet payloads.
+        if (i == 1) continue;
+        const size_t expectedSize = i == 0 ? 496 : 248;
+        expect(span < frame.spans.size() && frame.spans[span].offset == segments[i].offset &&
+               frame.spans[span].size == expectedSize,
+               "long map spans exclude lost bytes and padding");
+        ++span;
+    }
+    expect(span == frame.spans.size(), "long map emits no extra spans");
+
+    expect(!PyroWaveFraming::parse(nullptr, 0, geometry, frame, error),
+           "a malformed frame after partial delivery is rejected");
+    expect(frame.spans.empty() && !frame.partial && !frame.sequenceHeaderSeen &&
+           frame.blockRecords == 0 && frame.paddingBytes == 0 && frame.coarseLevelIntact,
+           "reused frame state resets even on an early parse failure");
+
+    segments = losePackets(data, shard, {});
+    expect(PyroWaveFraming::parse(data.data(), data.size(), segments, geometry, frame, error) &&
+           !frame.partial && frame.coarseLevelIntact && frame.blockRecords == packets &&
+           frame.paddingBytes == (packets - 1) * 8,
+           "an intact frame after partial and failed frames resets loss state");
+
+    std::vector<uint8_t> body, prefixed;
+    putSequenceHeader(body, geometry.width, geometry.height, 1, true);
+    putBlock(body, 0, 2);
+    putU32(prefixed, 1);
+    putU32(prefixed, uint32_t(body.size()));
+    prefixed.insert(prefixed.end(), body.begin(), body.end());
+    expect(parse(prefixed, geometry, frame) && frame.framing == Framing::LengthPrefixed &&
+           frame.spans.size() == 1 && frame.blockRecords == 1 && frame.paddingBytes == 0,
+           "reused frame can switch from record framing to length-prefixed framing");
+}
+
 }
 
 int main()
@@ -422,6 +484,7 @@ int main()
     testLengthPrefixedFraming();
     testRejections();
     testPartialFrames();
+    testLongPacketMapAndFrameReuse();
 
     if (g_Failures == 0) {
         std::printf("PyroWave framing: all checks passed\n");

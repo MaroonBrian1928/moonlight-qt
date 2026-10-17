@@ -355,6 +355,10 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
                                  QString& error)
 {
     const auto fail = [&error](const char* text) { error = text; return false; };
+    if (value.playoutInputStableAdaptation > 1)
+        return fail("stable input adaptation must be 0 or 1");
+    if (value.playoutInputHitchMissesOnly > 10)
+        return fail("input hitch-miss policy must be between 0 and 10");
     if (value.playoutPredictionOnly > 1 || value.playoutSubmissionEstimateFallback > 1 ||
             value.playoutRequireDisplayEvents > 1 ||
             value.playoutNativeHitchAdaptation > 1 || value.playoutReadinessDrivenAdaptation > 1 ||
@@ -362,8 +366,31 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.renderStartPreserveLearnedLead > 1 ||
             value.playoutDelayCapUsesObservedPeriod > 1 ||
             value.playoutCapacityTelemetry > 1 ||
+            value.playoutAbsorbedJitterRelease > 1 ||
+            value.playoutInputPercentileEnabled > 1 ||
+            value.playoutInputBoundedRecoveryCredit > 1 ||
+            value.playoutInputRateDropSnap > 1 ||
             value.playoutGpuReadinessAdaptation > 1) {
-        return fail("prediction-only, display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, learned preparation lead, observed-period cap, capacity telemetry, and GPU readiness flags must be 0 or 1");
+        return fail("prediction-only, display event requirement, native hitch adaptation, readiness adaptation, stable smoothness reference, learned preparation lead, observed-period cap, capacity telemetry, absorbed jitter release, and GPU readiness flags must be 0 or 1");
+    }
+    if (value.playoutInputClockRelativeHistory > 3) {
+        return fail("playout_input_clock_relative_history must be 0 to 3");
+    }
+    if (value.playoutInputPercentileToleranceUs != 0 &&
+        (value.playoutInputPercentileToleranceUs < 250 || value.playoutInputPercentileToleranceUs > 2000 ||
+         value.playoutInputPercentileToleranceUs % 250 != 0)) {
+        return fail("input percentile tolerance must be zero for historical strict coverage, or 250..2000us in 250us steps");
+    }
+    if (value.playoutInputPercentileEnabled &&
+        (value.playoutResponsiveBuffer < 12 || value.playoutPredictionOnly != 1 ||
+         value.playoutInputPercentileTargetPerMillion < 900000 ||
+         value.playoutInputPercentileTargetPerMillion > 999900 ||
+         value.playoutInputPercentileWindowUs < 10000000 ||
+         value.playoutInputPercentileWindowUs > 300000000 ||
+         value.playoutInputPercentileRiseUsPerSecond < 250 ||
+         value.playoutInputPercentileRiseUsPerSecond > 1000 ||
+         value.playoutInputPercentileFallUsPerSecond != 250)) {
+        return fail("experimental input percentile requires revision12+, prediction-only, explicit90..99.99% INPUT coverage,10..300s history,250..1000us/s rise and250us/s fall");
     }
     if (value.baseGuardDivisor == 0 ||
             value.pacingLatencyExtraPeriodDenominator == 0 ||
@@ -433,6 +460,12 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutAdaptiveOnly > 1) {
         return fail("playout_adaptive_only must be 0 or 1");
     }
+    if (value.nativeSynchronizedPresentation > 1) {
+        return fail("native_synchronized_presentation must be 0 or 1");
+    }
+    if (value.nativeScheduledPresentation > 1) {
+        return fail("native_scheduled_presentation must be 0 or 1");
+    }
     if (value.latencyFixEnabled > 1 || value.latencyFixAllRates > 1 || value.latencyFixDelayPeriodPerMille > 1000) {
         return fail("latency_fix_enabled and latency_fix_all_rates must be 0 or 1 and latency_fix_delay_period_per_mille must be in 0..1000");
     }
@@ -481,14 +514,17 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
             value.playoutIntervalInitialMinimumSamples > 512) {
         return fail("initial interval calibration requires 250000..1000000 us and 2..512 samples");
     }
-    if (value.playoutResponsiveBuffer > 8 || (value.playoutResponsiveBuffer &&
+    if (value.playoutResponsiveBuffer > 12 || (value.playoutResponsiveBuffer &&
             (!value.playoutPredictionOnly || value.playoutReadinessHitchThresholdUs))) {
         return fail("playout_responsive_buffer requires prediction-only playout without historical hitch feedback");
     }
+    if (value.playoutHoldRenewBelowTarget > 3) {
+        return fail("playout_hold_renew_below_target revision must be 0..3");
+    }
     if (value.playoutSourceMappingDecoderOutput > 1 ||
             value.playoutSerialServiceGate > 2 ||
-            value.playoutRecentPressureRelease > 2) {
-        return fail("source mapping flag must be 0 or 1; recent pressure and serial service revisions must be 0..2");
+            value.playoutRecentPressureRelease > 3) {
+        return fail("source mapping flag must be 0 or 1; serial service revision must be 0..2 and recent pressure revision 0..3");
     }
     if ((value.playoutSerialServiceGate || value.playoutRecentPressureRelease) &&
             value.playoutResponsiveBuffer < 6) {
@@ -523,8 +559,43 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     if (value.playoutCatchupPerMille > 100) {
         return fail("playout_catchup_per_mille must be in 0..100");
     }
-    if (value.playoutSmoothingWindowedCadence > 2) {
-        return fail("playout_smoothing_windowed_cadence must be in 0..2");
+    if (value.playoutIntervalToleranceUs != 0 &&
+            (value.playoutIntervalToleranceUs < 250 || value.playoutIntervalToleranceUs > 2000 ||
+             value.playoutIntervalToleranceUs % 250 != 0)) {
+        return fail("playout_interval_tolerance_us must be 0 (legacy) or 250..2000 in steps of 250");
+    }
+    if (value.playoutLateRecovery > 1 ||
+            (value.playoutLateRecovery && value.playoutCatchupPerMille == 0)) {
+        return fail("playout_late_recovery must be 0 or 1 and requires nonzero catchup");
+    }
+    if (value.playoutSmoothingWindowedCadence > 7) {
+        return fail("playout_smoothing_windowed_cadence must be in 0..7");
+    }
+    // Revisions before 5 ignore these, so historical snapshots may be layered
+    // over current values.
+    if (value.playoutSmoothingRecenterPerMille > 1000 ||
+            value.playoutSmoothingAbsorbReserveUs > 20000 ||
+            value.playoutSmoothingAbsorbReservePeriodPerMille > 1000 ||
+            value.playoutSmoothingMaxLagPeriodPerMille > 1000) {
+        return fail("playout_smoothing recentre must be 0..1000 per mille, absorb reserve 0..20000 us, and the absorb and lag period shares 0..1000 per mille");
+    }
+    if (value.playoutInputLearningTrim > 64) {
+        return fail("playout_input_learning_trim must be in 0..64");
+    }
+    if (value.playoutInputLayerSeedRatioPerMille > 100000) {
+        return fail("playout_input_layer_seed_ratio_per_mille must be in 0..100000");
+    }
+    if (value.playoutCatchupCarryLimitUs > 100000 || value.playoutCatchupCarryLimitPeriodPerMille > 1000) {
+        return fail("playout_catchup_carry_limit_us must be 0..100000 and its period share 0..1000 per mille");
+    }
+    if (value.playoutInputRecoveryCreditRoomPerMille > 1000) {
+        return fail("playout_input_recovery_credit_room_per_mille must be in 0..1000");
+    }
+    if (value.playoutSmoothingFloorMarginUs > 20000) {
+        return fail("playout_smoothing_floor_margin_us must be in 0..20000");
+    }
+    if (value.playoutSmoothingPresentableFloor > 1) {
+        return fail("playout_smoothing_presentable_floor must be 0 or 1");
     }
     if (value.playoutSmoothingRecoveryUs > 1000000) {
         return fail("playout_smoothing_recovery_us must be in 0..1000000");
@@ -542,6 +613,9 @@ bool validateVrrTimingParameters(const VrrTimingParameters& value,
     }
     if (value.playoutSmoothingResetSlewUs > 100000) {
         return fail("playout_smoothing_reset_slew_us must be in 0..100000");
+    }
+    if (value.playoutSmoothingReadinessBound > 1) {
+        return fail("playout_smoothing_readiness_bound must be 0 or 1");
     }
     if (value.playoutQueueFrames > VrrLargestQueuedFrames) {
         return fail("playout_queue_frames must be 0 (historical three) or at most the decoder-backed limit");
@@ -745,6 +819,8 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
         configuration.commonControllerCustomized =
             parameterObject.value("controller").isObject() &&
             !parameterObject.value("controller").toObject().isEmpty();
+        configuration.commonControllerOverrides =
+            parameterObject.value("controller").toObject();
     }
     const QJsonValue scenariosValue = root.value("scenarios");
     if (!scenariosValue.isArray() || scenariosValue.toArray().isEmpty()) {
@@ -756,7 +832,7 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
         if (!item.isObject()) { error = "each scenario must be an object"; return false; }
         const QJsonObject object = item.toObject();
         for (auto it = object.constBegin(); it != object.constEnd(); ++it) {
-            if (it.key() != "name" && it.key() != "mode" &&
+            if (it.key() != "name" && it.key() != "mode" && it.key() != "base" &&
                     it.key() != "parameters" && it.key() != "assertions") {
                 error = "unknown scenario key: " + it.key(); return false;
             }
@@ -768,8 +844,14 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
         scenario.worker = configuration.commonWorker;
         scenario.display = configuration.commonDisplay;
         scenario.execution = configuration.commonExecution;
+        scenario.controllerOverrides = configuration.commonControllerOverrides;
         scenario.name = object.value("name").toString();
         scenario.mode = object.value("mode").toString("fixed");
+        const QString base = object.value("base").toString("generic");
+        if (base != "generic" && base != "session") {
+            error = "scenario base must be generic or session"; return false;
+        }
+        scenario.controllerFromSession = base == "session";
         if (scenario.name.isEmpty() || names.contains(scenario.name)) {
             error = "scenario names must be non-empty and unique"; return false;
         }
@@ -789,6 +871,12 @@ bool loadVrrReplayConfiguration(const QByteArray& json,
                 scenario.controllerCustomized ||
                 (parameterObject.value("controller").isObject() &&
                  !parameterObject.value("controller").toObject().isEmpty());
+            const QJsonObject controllerObject =
+                parameterObject.value("controller").toObject();
+            for (auto it = controllerObject.constBegin();
+                    it != controllerObject.constEnd(); ++it) {
+                scenario.controllerOverrides.insert(it.key(), it.value());
+            }
         }
         if (object.contains("assertions")) {
             if (!object.value("assertions").isArray()) {
@@ -848,6 +936,13 @@ bool applyVrrReplayOverride(const QString& expression,
     QJsonObject section;
     section[path.section('.', 1, 1)] = static_cast<double>(number);
     if (path.startsWith("controller.")) {
+        if (scenario.controllerFromSession) {
+            // Validated as one snapshot on top of the session policy later.
+            scenario.controllerOverrides.insert(section.constBegin().key(),
+                                                section.constBegin().value());
+            scenario.controllerCustomized = true;
+            return true;
+        }
         if (!applyControllerObject(section, scenario.controller, error)) {
             return false;
         }

@@ -6,6 +6,7 @@
 class ComputerModel : public QAbstractListModel
 {
     Q_OBJECT
+    Q_PROPERTY(QVariantList onlineHosts READ onlineHosts NOTIFY onlineHostsChanged)
 
     enum Roles
     {
@@ -43,9 +44,14 @@ public:
 
     Q_INVOKABLE void renameComputer(int computerIndex, QString name);
 
+    Q_INVOKABLE QString uuidAt(int computerIndex) const;
+
+    QVariantList onlineHosts() const;
+
     Q_INVOKABLE Session* createSessionForCurrentGame(int computerIndex);
 
 signals:
+    void onlineHostsChanged();
     void pairingCompleted(QVariant error);
     void connectionTestCompleted(int result, QString blockedPorts);
 

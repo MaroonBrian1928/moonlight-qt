@@ -294,7 +294,10 @@ bool Decoder::Impl::dequant(CommandBuffer &cmd)
 {
 	DequantizerPushData push = {};
 
-	cmd.set_specialization_constant_mask(0);
+	// The Deck's RADV path benefits from coalescing scalar coefficient writes.
+	// Keep the original store layout on drivers not covered by that measurement.
+	cmd.set_specialization_constant_mask(1);
+	cmd.set_specialization_constant(0, device->get_device_features().driver_id == VK_DRIVER_ID_MESA_RADV);
 	cmd.enable_subgroup_size_control(true);
 
 	if (device->supports_subgroup_size_log2(true, 4, 7))

@@ -17,16 +17,22 @@ win32:!winrt {
 }
 
 # PyroWave codec library (see pyrowave/VENDOR.txt). Must match the condition
-# in app/app.pro.
-if(win32:!winrt:contains(QT_ARCH, x86_64)|macx):!disable-pyrowave {
+# in app/app.pro. Linux uses libplacebo; macOS shares MoltenVK outputs with Metal.
+win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
+    SUBDIRS += pyrowave
+    app.depends += pyrowave
+}
+linux:contains(QT_ARCH, x86_64):!disable-pyrowave:!disable-libplacebo:packagesExist(libplacebo) {
+    SUBDIRS += pyrowave
+    app.depends += pyrowave
+}
+macx:!disable-prebuilts:!disable-pyrowave {
     SUBDIRS += pyrowave
     app.depends += pyrowave
 
-    # Its native Metal port, preferred on Apple Silicon (see pyrowave-metal/)
-    macx {
-        SUBDIRS += pyrowave-metal
-        app.depends += pyrowave-metal
-    }
+    # Our native Metal port, opt-in with PYROWAVE_BACKEND=metal (see pyrowave-metal/)
+    SUBDIRS += pyrowave-metal
+    app.depends += pyrowave-metal
 }
 
 # Support debug and release builds from command line for CI

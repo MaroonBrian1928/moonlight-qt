@@ -7,6 +7,7 @@
 
 #include <QMutex>
 #include "vrr/readinesswindow.h"
+#include "../../timinggraph.h"
 
 // Pacer work can happen on the decoder, render, V-sync, and VRR worker
 // threads. Keep its cumulative measurements separate from VIDEO_STATS, which
@@ -67,12 +68,18 @@ struct PacerTelemetrySnapshot {
     uint64_t vrrGuardUs = 0;
     uint64_t vrrSourcePeriodUs = 0;
     uint64_t vrrAppliedBufferUs = 0, vrrBufferCapUs = 0, vrrGpuReadinessLeadUs = 0;
+    // Requested positive phase beyond the input buffer: cadence retiming,
+    // display floor and retained recovery. Independent of how much of this
+    // frame's readiness wait has already elapsed; excludes a new input miss.
+    uint64_t vrrAppliedSmoothingUs = 0;
 };
 
 struct VrrTelemetrySample {
+    Overlay::TimingGraphInput graph;
     uint64_t queueResidenceUs = 0;
     uint64_t decodeWaitUs = 0;
     uint64_t bufferUs = 0;
+    uint64_t smoothingUs = 0;
     uint64_t submissionUs = 0;
     // Reset only at a real presentation epoch boundary. Local drops and host
     // stalls affect motion and must not erase the following interval.
@@ -109,6 +116,14 @@ struct VrrTelemetrySample {
 
 class PacerTelemetry {
 public:
+    Overlay::TimingGraphSnapshot timingGraphSnapshot(uint64_t atUs = 0) const
+    {
+        Overlay::TimingGraphSnapshot points;
+        points.points.reserve(Overlay::TimingGraphHistory::Capacity); // Allocate before locking.
+        QMutexLocker lock(&m_Lock);
+        m_TimingGraph.copyTo(points, atUs);
+        return points;
+    }
     PacerTelemetrySnapshot snapshot() const
     {
         QMutexLocker lock(&m_Lock);
@@ -177,6 +192,7 @@ public:
     void recordVrrFrame(const VrrTelemetrySample& sample)
     {
         QMutexLocker lock(&m_Lock);
+        m_TimingGraph.record(sample.graph);
 
         if (sample.motionDiscontinuity) {
             m_LastMotionSubmissionUs = m_LastMotionIntervalUs = 0;
@@ -247,6 +263,7 @@ public:
         m_Snapshot.vrrGuardUs = sample.guardUs;
         m_Snapshot.vrrSourcePeriodUs = sample.sourcePeriodUs;
         m_Snapshot.vrrAppliedBufferUs = sample.bufferUs;
+        m_Snapshot.vrrAppliedSmoothingUs = sample.smoothingUs;
         m_Snapshot.vrrBufferCapUs = sample.bufferCapUs;
         m_Snapshot.vrrGpuReadinessLeadUs = sample.gpuReadinessLeadUs;
     }
@@ -353,6 +370,7 @@ private:
 
     mutable QMutex m_Lock;
     PacerTelemetrySnapshot m_Snapshot;
+    Overlay::TimingGraphHistory m_TimingGraph;
     uint64_t m_LastMotionSubmissionUs = 0;
     uint64_t m_LastMotionIntervalUs = 0;
     std::array<uint64_t, kPrepareLatenessSampleCount> m_PrepareLatenessSamples {};

@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 // Copyright (c) 2025 Hans-Kristian Arntzen
 // SPDX-License-Identifier: MIT
 #extension GL_KHR_shader_subgroup_basic : require
@@ -14,6 +15,7 @@
 #endif
 
 layout(local_size_x = 128) in;
+layout(constant_id = 0) const bool CoalescedStores = false;
 
 layout(set = 0, binding = 0) writeonly uniform image2DArray uDequantImg;
 
@@ -217,6 +219,36 @@ void scan_subgroups_fallback(uint local_index)
 }
 
 
+// Each decoder lane owns a 4x2 patch. Its eight scalar image stores otherwise
+// revisit widely spaced texels across the wave. Stage the tile at full precision
+// so neighboring lanes can write neighboring texels instead. The specialization
+// removes this storage and barrier on drivers using the original path.
+shared float output_values[32 * 32];
+
+void store_coefficients(ivec2 coord, uint local_index, mat2x4 values)
+{
+    if (CoalescedStores)
+    {
+        ivec2 tile_coord = coord & ivec2(31);
+        for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 4; i++)
+                output_values[(tile_coord.y + j) * 32 + tile_coord.x + i] = values[j][i];
+        barrier();
+
+        for (uint i = local_index; i < 32 * 32; i += 128)
+        {
+            ivec2 pixel = ivec2(gl_WorkGroupID.xy) * 32 + ivec2(i % 32, i / 32);
+            imageStore(uDequantImg, ivec3(pixel, registers.output_layer), vec4(output_values[i]));
+        }
+    }
+    else
+    {
+        for (int j = 0; j < 2; j++)
+            for (int i = 0; i < 4; i++)
+                imageStore(uDequantImg, ivec3(coord + ivec2(i, j), registers.output_layer), vec4(values[j][i]));
+    }
+}
+
 void main()
 {
     uint local_index = gl_SubgroupID * gl_SubgroupSize + gl_SubgroupInvocationID;
@@ -241,9 +273,22 @@ void main()
 
     if (offset_u32 == ~0u)
     {
-        for (int j = 0; j < 2; j++)
-            for (int i = 0; i < 4; i++)
-                imageStore(uDequantImg, ivec3(coord + ivec2(i, j), registers.output_layer), vec4(0.0));
+        // No lane exchange is needed for a constant tile. Keep this early exit
+        // free of barriers; all lanes in the workgroup see the same offset.
+        if (CoalescedStores)
+        {
+            for (uint i = local_index; i < 32 * 32; i += 128)
+            {
+                ivec2 pixel = ivec2(gl_WorkGroupID.xy) * 32 + ivec2(i % 32, i / 32);
+                imageStore(uDequantImg, ivec3(pixel, registers.output_layer), vec4(0.0));
+            }
+        }
+        else
+        {
+            for (int j = 0; j < 2; j++)
+                for (int i = 0; i < 4; i++)
+                    imageStore(uDequantImg, ivec3(coord + ivec2(i, j), registers.output_layer), vec4(0.0));
+        }
         return;
     }
 
@@ -385,7 +430,5 @@ void main()
     }
 
     // Write output.
-    for (int j = 0; j < 2; j++)
-        for (int i = 0; i < 4; i++)
-            imageStore(uDequantImg, ivec3(coord + ivec2(i, j), registers.output_layer), vec4(v[j][i]));
+    store_coefficients(coord, local_index, v);
 }

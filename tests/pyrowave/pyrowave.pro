@@ -1,12 +1,23 @@
 TEMPLATE = subdirs
 CONFIG += ordered
 
+linkpolicy.file = $$PWD/linkpolicy.pro
+SUBDIRS += linkpolicy
+
+d3d11interop.file = $$PWD/d3d11interop.pro
+SUBDIRS += d3d11interop
+
 framing.file = $$PWD/framing.pro
 SUBDIRS += framing
 
-# The round trip compiles the vendored codec and needs a Vulkan GPU at runtime.
-# Its CPU decode is the macOS client's system-memory fallback.
-if(win32:contains(QT_ARCH, x86_64)|macx) {
+compression.file = $$PWD/compression.pro
+SUBDIRS += compression
+
+sdp.file = $$PWD/sdp.pro
+SUBDIRS += sdp
+
+# The round trip compiles the vendored codec and needs a Vulkan GPU at runtime
+win32:contains(QT_ARCH, x86_64) {
     roundtrip.file = $$PWD/roundtrip.pro
     SUBDIRS += roundtrip
 }
@@ -16,6 +27,26 @@ win32:contains(QT_ARCH, x86_64) {
     d3d11.file = $$PWD/d3d11.pro
     SUBDIRS += d3d11
 }
+linux:contains(QT_ARCH, x86_64) {
+    roundtrip.file = $$PWD/roundtrip.pro
+    SUBDIRS += roundtrip
+}
+macx {
+    roundtrip.file = $$PWD/roundtrip.pro
+    SUBDIRS += roundtrip
+
+    metalcalibration.file = $$PWD/metalcalibration.pro
+    SUBDIRS += metalcalibration
+}
+
+rtpqueue.file = $$PWD/rtpqueue.pro
+SUBDIRS += rtpqueue
+
+udpreceive.file = $$PWD/udpreceive.pro
+SUBDIRS += udpreceive
+
+udpaddress.file = $$PWD/udpaddress.pro
+SUBDIRS += udpaddress
 
 macx {
     # The client's native Metal decoder against the source and the Vulkan

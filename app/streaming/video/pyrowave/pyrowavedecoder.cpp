@@ -1,31 +1,58 @@
 #include "pyrowavedecoder.h"
-#include "pyrowavevulkansurfaces.h"
 
 #include <vulkan/vulkan.h>
 #include <pyrowave.h>
 
 #include <Limelight.h>
 #include <SDL.h>
+#include <algorithm>
+#include <chrono>
 
+#ifdef _WIN32
 #include <array>
 #include <deque>
 #include <mutex>
-
-#ifdef _WIN32
 #include <windows.h>
-#else
-#include <SDL_vulkan.h>
-#include <dlfcn.h>
-#include <cstdlib>
 #endif
 
 namespace {
 
+constexpr unsigned kFrameContexts = 4;
+
+class DecodePhaseTimer {
+public:
+    explicit DecodePhaseTimer(PyroWaveDecoder::DecodeDiagnostics* diagnostics)
+        : m_Diagnostics(diagnostics)
+    {
+        if (m_Diagnostics) {
+            *m_Diagnostics = {};
+            m_Start = Clock::now();
+        }
+    }
+    ~DecodePhaseTimer() { finish(); }
+    void next(unsigned phase) { finish(); m_Phase = phase; }
+private:
+    using Clock = std::chrono::steady_clock;
+    void finish()
+    {
+        if (m_Diagnostics) {
+            const auto now = Clock::now();
+            m_Diagnostics->phaseUs[m_Phase] +=
+                std::chrono::duration_cast<std::chrono::microseconds>(now - m_Start).count();
+            m_Start = now;
+        }
+    }
+    PyroWaveDecoder::DecodeDiagnostics* m_Diagnostics;
+    unsigned m_Phase = 0;
+    Clock::time_point m_Start;
+};
+
+#ifdef _WIN32
 // A surface the decoder may overwrite once its GPU wait completes
 struct FreeSurface {
     int surface;
-    // Wait for this value of the renderer's release (hold) semaphore, or of
-    // the decode semaphore if the last write was never sampled. 0: no wait.
+    // Wait for this value of the renderer's release fence, or of the decode
+    // fence if the last write was never sampled. 0: no wait.
     uint64_t waitValue;
     bool waitForDecode;
 };
@@ -63,13 +90,9 @@ void freeFrameRef(void* opaque, uint8_t* data)
     auto ref = reinterpret_cast<PyroWaveFrameRef*>(data);
 
     const uint64_t releaseValue = ref->releaseFenceValue.load(std::memory_order_acquire);
-    if (releaseValue == PyroWaveFrameRef::k_Quarantined) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "PyroWave: retiring surface %d, which the renderer could not hand back",
-                    ref->surface);
-    }
-    else if (releaseValue == 0) {
-        // Never sampled: order the next write after this frame's decode
+    if (releaseValue == 0) {
+        // Never sampled (dropped by the pacer): order the next write into this
+        // surface after this frame's decode so two writes cannot overlap.
         owner->freeList->push({ ref->surface, ref->decodeFenceValue, true });
     }
     else {
@@ -82,13 +105,9 @@ void freeFrameRef(void* opaque, uint8_t* data)
 
 void closeOsHandle(uintptr_t handle)
 {
-#ifdef _WIN32
     if (handle != 0) {
         CloseHandle(reinterpret_cast<HANDLE>(handle));
     }
-#else
-    (void)handle;
-#endif
 }
 
 VkFormat toVkFormat(PyroWavePlaneFormat format)
@@ -100,23 +119,6 @@ VkFormat toVkFormat(PyroWavePlaneFormat format)
     default:
         return VK_FORMAT_R8_UNORM;
     }
-}
-
-#ifndef _WIN32
-// Granite finds its own Vulkan loader by bare library name, which may miss a
-// copy bundled with the app. Point it at the library SDL loads instead.
-void useSdlVulkanLibrary()
-{
-    if (getenv("GRANITE_VULKAN_LIBRARY") != nullptr || SDL_Vulkan_LoadLibrary(nullptr) != 0) {
-        return;
-    }
-
-    Dl_info info;
-    void* getInstanceProcAddr = SDL_Vulkan_GetVkGetInstanceProcAddr();
-    if (getInstanceProcAddr != nullptr && dladdr(getInstanceProcAddr, &info) && info.dli_fname != nullptr) {
-        setenv("GRANITE_VULKAN_LIBRARY", info.dli_fname, 0);
-    }
-    SDL_Vulkan_UnloadLibrary();
 }
 #endif
 
@@ -145,23 +147,23 @@ struct PyroWaveDecoder::Impl {
 
     pyrowave_device device = nullptr;
     pyrowave_decoder decoder = nullptr;
+#ifdef _WIN32
     pyrowave_sync_object decodeSync = nullptr;
     pyrowave_sync_object releaseSync = nullptr;
-    // Signalled by each decode; waited on by the renderer
-    VkSemaphore decodeSemaphore = VK_NULL_HANDLE;
     uint64_t decodeValue = 0;
 
     struct Surface {
-        // Imported images (null when the planes live on the renderer's device)
         std::array<pyrowave_image, 3> images {};
         pyrowave_gpu_buffers buffers {};
-        // Signalled by the renderer once it stops reading the surface
-        VkSemaphore holdSemaphore = VK_NULL_HANDLE;
     };
     std::vector<Surface> surfaces;
     std::shared_ptr<SurfaceFreeList> freeList = std::make_shared<SurfaceFreeList>();
+#else
+    IPyroWaveVulkanPool* vulkanPool = nullptr;
+#endif
 
     PyroWaveFraming::Frame parsed;
+    bool reportDiagnostics = false;
 
     ~Impl()
     {
@@ -169,6 +171,15 @@ struct PyroWaveDecoder::Impl {
         if (decoder != nullptr) {
             pyrowave_decoder_destroy(decoder);
         }
+        // Report before destroying imported Windows images: each image teardown
+        // advances the codec's frame context and would dilute these averages.
+        if (device != nullptr && reportDiagnostics) {
+            pyrowave_device_report_performance_stats(device, [](void*, const char* message) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                            "PyroWave GPU history (per codec frame context): %s", message);
+            }, nullptr, false);
+        }
+#ifdef _WIN32
         for (auto& surface : surfaces) {
             for (auto image : surface.images) {
                 if (image != nullptr) {
@@ -182,11 +193,13 @@ struct PyroWaveDecoder::Impl {
         if (releaseSync != nullptr) {
             pyrowave_sync_object_destroy(releaseSync);
         }
+#endif
         if (device != nullptr) {
             pyrowave_device_destroy(device);
         }
     }
 
+#ifdef _WIN32
     bool importFence(uintptr_t handle, pyrowave_sync_object& sync)
     {
         if (handle == 0) {
@@ -229,7 +242,8 @@ struct PyroWaveDecoder::Impl {
                 continue;
             }
 
-            VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+            VkImageCreateInfo imageInfo = {};
+            imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
             imageInfo.imageType = VK_IMAGE_TYPE_2D;
             imageInfo.format = toVkFormat(planes[plane].format);
@@ -245,9 +259,7 @@ struct PyroWaveDecoder::Impl {
             pyrowave_image_create_info info = {};
             info.device = device;
             info.external_handle = planes[plane].handle;
-#ifdef _WIN32
             info.handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
-#endif
             info.image_create_info = &imageInfo;
 
             pyrowave_result result = pyrowave_image_create(&info, &surface.images[plane]);
@@ -282,29 +294,39 @@ struct PyroWaveDecoder::Impl {
             return false;
         }
 
-        surface.holdSemaphore = pyrowave_sync_object_get_semaphore(releaseSync);
         surfaces.push_back(surface);
         return true;
     }
+#endif
 };
 
 PyroWaveDecoder::PyroWaveDecoder() = default;
 
 PyroWaveDecoder::~PyroWaveDecoder() = default;
 
-bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* pool,
-                                 IPyroWaveVulkanSurfaces* vulkanSurfaces)
+bool PyroWaveDecoder::hasAsynchronousOutput() const
+{
+#ifdef _WIN32
+    return m_Impl != nullptr;
+#else
+    return m_Impl && m_Impl->vulkanPool != nullptr;
+#endif
+}
+
+bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* pool)
 {
     SDL_assert(!m_Impl);
 
     if (config.width <= 0 || config.height <= 0) {
         return false;
     }
-    if (pool == nullptr && vulkanSurfaces == nullptr && config.tenBit) {
-        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: system memory output is 8-bit only");
+#ifdef _WIN32
+    if (pool == nullptr) {
         return false;
     }
+#else
+    (void)pool;
+#endif
     if (!config.chroma444 && ((config.width | config.height) & 1)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
                      "PyroWave: 4:2:0 streams need an even width and height (%dx%d)",
@@ -316,42 +338,82 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
     impl->config = config;
     impl->geometry = { config.width, config.height, config.chroma444 };
 
+
     uint32_t major = 0, minor = 0, patch = 0;
     pyrowave_get_api_version(&major, &minor, &patch);
 
-    pyrowave_result result;
-    if (pool != nullptr) {
-        uint8_t luid[8];
-        if (!pool->pyroWaveAdapterLuid(luid)) {
-            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                         "PyroWave: renderer adapter identity is unavailable");
-            return false;
-        }
+#ifdef _WIN32
+    uint8_t luid[8];
+    if (!pool->pyroWaveAdapterLuid(luid)) {
+        SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                     "PyroWave: renderer adapter identity is unavailable");
+        return false;
+    }
 
-        static_assert(sizeof(pyrowave_luid) == sizeof(luid), "LUID size mismatch");
-        result = pyrowave_create_device_by_compat(
-            0, 0, nullptr, nullptr, reinterpret_cast<const pyrowave_luid*>(luid), &impl->device);
-    }
-    else if (vulkanSurfaces != nullptr) {
-        result = pyrowave_create_device(vulkanSurfaces->pyroWaveDeviceInfo(), &impl->device);
-    }
-    else {
-#ifndef _WIN32
-        useSdlVulkanLibrary();
-#endif
-        result = pyrowave_create_default_device(&impl->device);
-    }
+    static_assert(sizeof(pyrowave_luid) == sizeof(luid), "LUID size mismatch");
+    pyrowave_result result = pyrowave_create_device_by_compat(
+        0, 0, nullptr, nullptr, reinterpret_cast<const pyrowave_luid*>(luid), &impl->device);
     if (result != PYROWAVE_SUCCESS) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: no usable Vulkan device: %s",
+                     "PyroWave: no Vulkan device for the renderer's adapter: %s",
                      resultString(result));
         return false;
     }
 
-    if (pool != nullptr && !pyrowave_device_confirm_interop_support(impl->device)) {
+    const char* interopFailure = nullptr;
+    if (!pyrowave_device_confirm_d3d11_interop_support(impl->device,
+            config.tenBit ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM, &interopFailure)) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
-                     "PyroWave: the Vulkan driver cannot import D3D11 textures and fences");
+                     "PyroWave: D3D11 interoperability rejected: %s", interopFailure);
         return false;
+    }
+#else
+    pyrowave_result result = PYROWAVE_ERROR_NO_VULKAN;
+    PyroWaveVulkanDevice shared;
+    if (config.vulkanPool != nullptr && config.vulkanPool->pyroWaveVulkanDevice(shared)) {
+        pyrowave_device_create_info deviceInfo = {};
+        deviceInfo.GetInstanceProcAddr = shared.getInstanceProcAddr;
+        deviceInfo.instance = shared.instance;
+        deviceInfo.physical_device = shared.physicalDevice;
+        deviceInfo.device = shared.device;
+        deviceInfo.instance_create_info = shared.instanceInfo;
+        deviceInfo.device_create_info = shared.deviceInfo;
+        deviceInfo.queue_lock_callback = shared.lockQueues;
+        deviceInfo.queue_unlock_callback = shared.unlockQueues;
+        deviceInfo.userdata = shared.userdata;
+        result = pyrowave_create_device(&deviceInfo, &impl->device);
+        if (result == PYROWAVE_SUCCESS) {
+            impl->vulkanPool = config.vulkanPool;
+        }
+        else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "PyroWave: cannot share the renderer's Vulkan device (%s)%s",
+                        resultString(result), config.requireSharedOutput ? "" :
+                        "; reading frames back instead");
+            impl->device = nullptr;
+        }
+    }
+    if (impl->device == nullptr) {
+        if (config.requireSharedOutput) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: the renderer's shared Vulkan device is required");
+            return false;
+        }
+        result = pyrowave_create_default_device(&impl->device);
+        if (result != PYROWAVE_SUCCESS) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+                         "PyroWave: no usable Vulkan decode device: %s", resultString(result));
+            return false;
+        }
+    }
+#endif
+    // With two frame contexts, a decode blocks this thread until the GPU has
+    // finished the decode submitted two frames earlier. A brief GPU hiccup
+    // then ages queued frames past the stale limit and they are skipped. More
+    // contexts queue the work instead; the pacer sees late frames and decides.
+    if (pyrowave_device_set_frame_contexts(impl->device, kFrameContexts) != PYROWAVE_SUCCESS) {
+        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                    "PyroWave: keeping the default frame context count");
     }
 
     pyrowave_decoder_create_info decoderInfo = {};
@@ -360,6 +422,12 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
     decoderInfo.height = config.height;
     decoderInfo.chroma = config.chroma444 ? PYROWAVE_CHROMA_SUBSAMPLING_444 : PYROWAVE_CHROMA_SUBSAMPLING_420;
     decoderInfo.fragment_path = pyrowave_decoder_device_prefers_fragment_path(impl->device);
+    // Keep PyroWave's default graphics queue. A separate compute queue still
+    // competes for shader cores with the compositor after our Present returns.
+    // In the Deck 4K capture, delayed Wayland presentations tracked completion
+    // of the next async decode even though this frame was already GPU-ready.
+    // Shared surfaces and timeline synchronization remain asynchronous; only
+    // the queue selection changes here.
     result = pyrowave_decoder_create(&decoderInfo, &impl->decoder);
     if (result != PYROWAVE_SUCCESS) {
         SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
@@ -368,31 +436,30 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
         return false;
     }
 
-    if (pool != nullptr) {
-        if (!impl->importFence(pool->exportPyroWaveDecodeFence(), impl->decodeSync) ||
-                !impl->importFence(pool->exportPyroWaveReleaseFence(), impl->releaseSync)) {
+    // Both pools keep their fixed-size output images alive until this decoder
+    // is destroyed. Reuse their Vulkan views instead of creating and retiring
+    // three new views (and associated descriptors) for every frame.
+#ifdef _WIN32
+    pyrowave_decoder_set_output_view_cache(impl->decoder, true);
+#else
+    pyrowave_decoder_set_output_view_cache(impl->decoder, impl->vulkanPool != nullptr);
+#endif
+
+#ifdef _WIN32
+    if (!impl->importFence(pool->exportPyroWaveDecodeFence(), impl->decodeSync) ||
+            !impl->importFence(pool->exportPyroWaveReleaseFence(), impl->releaseSync)) {
+        return false;
+    }
+
+    for (int i = 0; i < pool->pyroWaveSurfaceCount(); i++) {
+        if (!impl->importSurface(pool, i)) {
             return false;
         }
-        impl->decodeSemaphore = pyrowave_sync_object_get_semaphore(impl->decodeSync);
-
-        for (int i = 0; i < pool->pyroWaveSurfaceCount(); i++) {
-            if (!impl->importSurface(pool, i)) {
-                return false;
-            }
-            impl->freeList->push({ i, 0, false });
-        }
+        impl->freeList->push({ i, 0, false });
     }
-    else if (vulkanSurfaces != nullptr) {
-        impl->decodeSemaphore = vulkanSurfaces->pyroWaveDecodeSemaphore();
-        for (int i = 0; i < vulkanSurfaces->pyroWaveSurfaceCount(); i++) {
-            Impl::Surface surface;
-            uint64_t holdValue;
-            vulkanSurfaces->pyroWaveSurface(i, &surface.buffers, &surface.holdSemaphore, &holdValue);
-            impl->surfaces.push_back(surface);
-            impl->freeList->push({ i, holdValue, false });
-        }
-    }
+#endif
 
+#ifdef _WIN32
     SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
                 "PyroWave decoder ready: %dx%d %s %d-bit, %d surfaces, API %u.%u.%u, bitstream %s%s",
                 config.width, config.height,
@@ -401,6 +468,17 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
                 (int)impl->surfaces.size(),
                 major, minor, patch, PYROWAVE_BITSTREAM_ID,
                 decoderInfo.fragment_path ? " (fragment path)" : "");
+#else
+    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                "PyroWave decoder ready: %dx%d %s %d-bit, %s, API %u.%u.%u, bitstream %s%s",
+                config.width, config.height,
+                config.chroma444 ? "4:4:4" : "4:2:0",
+                config.tenBit ? 10 : 8,
+                impl->vulkanPool ? "shared renderer surfaces, graphics queue" :
+                                   "Vulkan readback",
+                major, minor, patch, PYROWAVE_BITSTREAM_ID,
+                decoderInfo.fragment_path ? " (fragment path)" : "");
+#endif
 
     m_Impl = std::move(impl);
     return true;
@@ -408,21 +486,32 @@ bool PyroWaveDecoder::initialize(const Config& config, IPyroWaveSurfacePool* poo
 
 bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
                              const std::vector<PyroWaveFraming::Segment>& packets, size_t criticalPackets,
-                             AVFrame* frame)
+                             AVFrame* frame, DecodeDiagnostics* diagnostics)
 {
     Impl& impl = *m_Impl;
+    DecodePhaseTimer phase(diagnostics);
+    impl.reportDiagnostics |= diagnostics != nullptr;
 
     m_LastFramePartial = false;
-    if (!PyroWaveFraming::parse(data, size, packets, criticalPackets, impl.geometry, impl.parsed, m_LastError)) {
+    if (!PyroWaveFraming::parse(data, size, packets, criticalPackets, impl.geometry,
+                                impl.parsed, m_LastError, impl.config.compression)) {
         return false;
     }
     m_LastFraming = impl.parsed.framing;
+    if (diagnostics) {
+        diagnostics->receivedBlocks = impl.parsed.blockRecords;
+        diagnostics->announcedBlocks = impl.parsed.announcedBlocks;
+        diagnostics->paddingBytes = impl.parsed.paddingBytes;
+        diagnostics->partial = impl.parsed.partial;
+        for (const auto& span : impl.parsed.spans) diagnostics->payloadBytes += span.size;
+    }
+    phase.next(1);
 
-    // Every frame is independent. Clearing first keeps the 3-bit sequence
-    // counter from treating a frame after a long drop as stale.
+    // Independent reconstruction also prevents stale three-bit sequence state
+    // after a long run of dropped frames.
     pyrowave_decoder_clear(impl.decoder);
     for (const auto& span : impl.parsed.spans) {
-        const pyrowave_result result = pyrowave_decoder_push_packet(impl.decoder, data + span.offset, span.size);
+        const pyrowave_result result = pyrowave_decoder_push_packet(impl.decoder, (span.expanded ? impl.parsed.expanded.data() : data) + span.offset, span.size);
         if (result != PYROWAVE_SUCCESS) {
             m_LastError = std::string("decoder rejected a packet: ") + resultString(result);
             return false;
@@ -436,114 +525,142 @@ bool PyroWaveDecoder::decode(const uint8_t* data, size_t size,
         }
     }
     else {
-        // A partial frame decodes if its coarsest wavelet level is intact and
-        // more than 90% of its blocks arrived; missing detail decodes as blur.
+        // A partial frame decodes whenever its coarsest wavelet level is
+        // intact. The host protects that level with parity and nothing else,
+        // so every other loss decodes as blur over the area it covered.
         // The parser checks the coarsest level: PyroWave's own check cannot tell
         // a lost block from an all-zero one that was never sent.
         if (!impl.parsed.coarseLevelIntact) {
             m_LastError = "part of the coarsest wavelet level was lost";
             return false;
         }
-        if (!pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.9f, nullptr, 0)) {
-            m_LastError = "too little of the frame arrived (" + std::to_string(impl.parsed.blockRecords) +
+        if (!pyrowave_decoder_decode_is_ready_with_sideband(impl.decoder, true, 0, 0.0f, nullptr, 0)) {
+            m_LastError = "no decodable blocks arrived (" + std::to_string(impl.parsed.blockRecords) +
                           " of " + std::to_string(impl.parsed.announcedBlocks) + " blocks)";
             return false;
         }
     }
     m_LastFramePartial = impl.parsed.partial;
+    phase.next(2);
 
+#ifndef _WIN32
+    if (impl.vulkanPool != nullptr) {
+        PyroWaveVulkanSurface surface;
+        if (!impl.vulkanPool->holdPyroWaveSurface(impl.config.width, impl.config.height,
+                                                  impl.config.chroma444, impl.config.tenBit, surface)) {
+            m_LastError = "no free output surface";
+            return false;
+        }
+
+        pyrowave_gpu_buffers buffers = {};
+        for (int plane = 0; plane < 3; ++plane) {
+            auto& view = buffers.planes[plane];
+            view.image = surface.images[plane];
+            view.width = surface.widths[plane];
+            view.height = surface.heights[plane];
+            view.image_format = view.view_format = surface.format;
+            view.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            view.swizzle = VK_COMPONENT_SWIZZLE_IDENTITY;
+            view.layout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+        pyrowave_gpu_sync_operation acquire = {};
+        acquire.sync = { surface.ready, surface.readyValue };
+        pyrowave_gpu_sync_operation release = {};
+        release.sync = { surface.done, surface.doneValue };
+
+        phase.next(3);
+        const pyrowave_result result = diagnostics ?
+            pyrowave_decoder_decode_gpu_buffer_with_context_timing(
+                impl.decoder, &acquire, &release, &buffers, &diagnostics->contextWaitUs) :
+            pyrowave_decoder_decode_gpu_buffer(impl.decoder, &acquire, &release, &buffers);
+        phase.next(4);
+        if (!impl.vulkanPool->releasePyroWaveSurface(surface, result == PYROWAVE_SUCCESS, frame)) {
+            m_LastError = result == PYROWAVE_SUCCESS ?
+                "cannot reference the output surface" :
+                std::string("GPU decode failed: ") + resultString(result);
+            return false;
+        }
+        frame->chroma_location = AVCHROMA_LOC_CENTER;
+        frame->flags |= AV_FRAME_FLAG_KEY;
+        return true;
+    }
+
+    // R16 UNORM planes span the full 16-bit range, which is how FFmpeg's
+    // 16-bit formats are normalized.
     frame->width = impl.config.width;
     frame->height = impl.config.height;
-    if (impl.config.tenBit) {
-        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV420P10;
+    frame->format = impl.config.tenBit ?
+        (impl.config.chroma444 ? AV_PIX_FMT_YUV444P16 : AV_PIX_FMT_YUV420P16) :
+        (impl.config.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P);
+    if (av_frame_get_buffer(frame, 32) < 0) {
+        m_LastError = "cannot allocate decoded frame";
+        return false;
     }
-    else {
-        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
+
+    pyrowave_cpu_buffer output = {};
+    output.width = frame->width;
+    output.height = frame->height;
+    output.format = impl.config.tenBit ?
+        (impl.config.chroma444 ? PYROWAVE_CPU_BUFFER_FORMAT_YUV444P16 :
+                                 PYROWAVE_CPU_BUFFER_FORMAT_YUV420P16) :
+        (impl.config.chroma444 ? PYROWAVE_CPU_BUFFER_FORMAT_YUV444P :
+                                 PYROWAVE_CPU_BUFFER_FORMAT_YUV420P);
+    for (int plane = 0; plane < 3; ++plane) {
+        const int planeHeight = plane != 0 && !impl.config.chroma444 ?
+            frame->height / 2 : frame->height;
+        output.data[plane] = frame->data[plane];
+        output.row_stride_in_bytes[plane] = size_t(frame->linesize[plane]);
+        output.plane_size_in_bytes[plane] = output.row_stride_in_bytes[plane] * planeHeight;
     }
-    // Hosts average each 2x2 quad for 4:2:0 chroma
+    phase.next(3);
+    const pyrowave_result result = pyrowave_decoder_decode_cpu_buffer_synchronous(
+        impl.decoder, &output);
+    phase.next(4);
+    if (result != PYROWAVE_SUCCESS) {
+        m_LastError = std::string("GPU decode/readback failed: ") + resultString(result);
+        return false;
+    }
+
     frame->chroma_location = AVCHROMA_LOC_CENTER;
     frame->flags |= AV_FRAME_FLAG_KEY;
-
-    return impl.surfaces.empty() ? decodeToMemory(frame) : decodeToSurface(frame);
-}
-
-bool PyroWaveDecoder::decodeToMemory(AVFrame* frame)
-{
-    Impl& impl = *m_Impl;
-
-    // A fresh allocation per frame; an AVBufferPool would avoid it if that shows in profiles
-    if (av_frame_get_buffer(frame, 0) < 0) {
-        m_LastError = "out of memory";
-        return false;
-    }
-
-    pyrowave_cpu_buffer buffer = {};
-    buffer.width = frame->width;
-    buffer.height = frame->height;
-    buffer.format = impl.config.chroma444 ? PYROWAVE_CPU_BUFFER_FORMAT_YUV444P : PYROWAVE_CPU_BUFFER_FORMAT_YUV420P;
-    for (int plane = 0; plane < 3; plane++) {
-        const int planeHeight = (plane == 0 || impl.config.chroma444) ? frame->height : frame->height / 2;
-        buffer.data[plane] = frame->data[plane];
-        buffer.row_stride_in_bytes[plane] = frame->linesize[plane];
-        buffer.plane_size_in_bytes[plane] = size_t(frame->linesize[plane]) * planeHeight;
-    }
-
-    const pyrowave_result result = pyrowave_decoder_decode_cpu_buffer_synchronous(impl.decoder, &buffer);
-    if (result != PYROWAVE_SUCCESS) {
-        av_frame_unref(frame);
-        m_LastError = std::string("decode failed: ") + resultString(result);
-        return false;
-    }
-
     return true;
-}
-
-bool PyroWaveDecoder::decodeToSurface(AVFrame* frame)
-{
-    Impl& impl = *m_Impl;
-
+#else
     FreeSurface entry;
     if (!impl.freeList->pop(entry)) {
         m_LastError = "no free output surface";
         return false;
     }
-
     const int surface = entry.surface;
-    const Impl::Surface& target = impl.surfaces[surface];
 
-    // Imported images change ownership around the decode; planes on the
-    // renderer's device are already held for the decoder in GENERAL layout.
     std::array<pyrowave_gpu_external_reference, 3> acquireImages;
     std::array<pyrowave_gpu_external_reference, 3> releaseImages;
-    const bool imported = target.images[0] != nullptr;
     for (int plane = 0; plane < 3; plane++) {
         // The previous contents are overwritten, so discard them
-        acquireImages[plane] = { target.images[plane], VK_QUEUE_FAMILY_IGNORED };
-        releaseImages[plane] = { target.images[plane], VK_QUEUE_FAMILY_EXTERNAL };
+        acquireImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_IGNORED };
+        releaseImages[plane] = { impl.surfaces[surface].images[plane], VK_QUEUE_FAMILY_EXTERNAL };
     }
 
     pyrowave_gpu_sync_operation acquire = {};
-    if (imported) {
-        acquire.images = acquireImages.data();
-        acquire.num_images = acquireImages.size();
-    }
+    acquire.images = acquireImages.data();
+    acquire.num_images = acquireImages.size();
     if (entry.waitValue != 0) {
         // Wait on the GPU for the renderer's last read, or the last write
-        acquire.sync.semaphore = entry.waitForDecode ? impl.decodeSemaphore : target.holdSemaphore;
+        acquire.sync.semaphore = pyrowave_sync_object_get_semaphore(
+            entry.waitForDecode ? impl.decodeSync : impl.releaseSync);
         acquire.sync.value = entry.waitValue;
     }
 
     const uint64_t decodeValue = impl.decodeValue + 1;
     pyrowave_gpu_sync_operation release = {};
-    if (imported) {
-        release.images = releaseImages.data();
-        release.num_images = releaseImages.size();
-    }
-    release.sync.semaphore = impl.decodeSemaphore;
+    release.images = releaseImages.data();
+    release.num_images = releaseImages.size();
+    release.sync.semaphore = pyrowave_sync_object_get_semaphore(impl.decodeSync);
     release.sync.value = decodeValue;
 
+    phase.next(3);
     const pyrowave_result result = pyrowave_decoder_decode_gpu_buffer(
-        impl.decoder, &acquire, &release, &target.buffers);
+        impl.decoder, &acquire, &release, &impl.surfaces[surface].buffers);
+    phase.next(4);
     if (result != PYROWAVE_SUCCESS) {
         impl.freeList->push(entry);
         m_LastError = std::string("decode submission failed: ") + resultString(result);
@@ -567,5 +684,18 @@ bool PyroWaveDecoder::decodeToSurface(AVFrame* frame)
         return false;
     }
 
+    frame->width = impl.config.width;
+    frame->height = impl.config.height;
+    if (impl.config.tenBit) {
+        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P10 : AV_PIX_FMT_YUV420P10;
+    }
+    else {
+        frame->format = impl.config.chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
+    }
+    // Hosts average each 2x2 quad for 4:2:0 chroma
+    frame->chroma_location = AVCHROMA_LOC_CENTER;
+    frame->flags |= AV_FRAME_FLAG_KEY;
+
     return true;
+#endif
 }

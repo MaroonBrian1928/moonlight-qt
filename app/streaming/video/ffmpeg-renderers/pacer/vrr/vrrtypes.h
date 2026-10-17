@@ -5,6 +5,9 @@
 // by the legacy pacing path, while these values describe the frame as it
 // crossed the decoder/pacer boundary.
 
+#include "../../../../../settings/vrrtimingoptions.h"
+
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -27,6 +30,9 @@ struct VrrSessionConfig {
     // A session preference resolved into the recorded controller parameters.
     // All presets retain jitter buffering and display-spacing protection.
     bool smoothFrameTiming = true;
+    // Adds a standing presentation reserve that Reduce judder may spend on
+    // late source frames. Has no effect unless smoothFrameTiming is set.
+    bool absorbMicrostutter = false;
     // Linux readiness boundaries differ from D3D11. Resolve into trace parameters.
     bool readinessHitchFeedback = false;
     // Historical near-ceiling checkbox, retained for old tests and captures.
@@ -34,6 +40,15 @@ struct VrrSessionConfig {
     // 0: Smooth, 1: Balanced Target, 2: Low Latency, across all VRR rates.
     // The IDs are persisted and therefore remain stable across label changes.
     int latencyMode = 0;
+    VrrTimingOptions timingOptions;
+    // Experimental activation marker; zero keeps normal policy. The effective
+    // profile smoothness target supplies probability (never this marker value).
+    // Main policy; a diagnostic control can select historical accounting.
+    bool correctInputAccounting = true;
+    bool experimentalBoundedCatchup = false;
+    uint64_t experimentalInputPercentilePpm = 0;
+    uint64_t experimentalInputPercentileWindowUs = 60000000;
+    uint64_t experimentalInputPercentileRiseUsPerSecond = 1000;
     // Session-native A/B choice, recorded separately from controller timing.
     bool allowTearing = true;
     std::string calibrationKey;
@@ -122,6 +137,16 @@ public:
         return m_DecoderOutputUs;
     }
 
+    void setDecoderOutputComplete(bool complete)
+    {
+        m_DecoderOutputComplete = complete;
+    }
+
+    bool decoderOutputComplete() const
+    {
+        return m_DecoderOutputComplete;
+    }
+
     uint64_t decodeSyncWaitUs() const
     {
         return m_DecodeSyncWaitUs;
@@ -157,6 +182,41 @@ public:
         return m_DecodeSubmitUs;
     }
 
+    // Time the decoder deliberately held this frame before decodeSubmitUs so
+    // its GPU decode would not delay the previous frame's flip. It is part of
+    // reassembled -> submit but is neither decoder backlog nor decode cost.
+    void setDecodeHoldUs(uint64_t holdUs)
+    {
+        m_DecodeHoldUs = holdUs;
+    }
+
+    uint64_t decodeHoldUs() const
+    {
+        return m_DecodeHoldUs;
+    }
+
+    // PyroWave data packets that arrived as zero-filled holes. Loss costs this
+    // frame detail, not timing: its lateness must not teach the pacer to buffer.
+    void setLostPackets(uint32_t lostPackets)
+    {
+        m_LostPackets = lostPackets;
+    }
+
+    uint32_t lostPackets() const
+    {
+        return m_LostPackets;
+    }
+
+    // Reassembled -> decode submission, excluding a deliberate hold.
+    uint64_t decoderQueueUs() const
+    {
+        if (!m_ReassembledUs || m_DecodeSubmitUs < m_ReassembledUs) {
+            return 0;
+        }
+        const uint64_t queueUs = m_DecodeSubmitUs - m_ReassembledUs;
+        return queueUs - (std::min)(queueUs, m_DecodeHoldUs);
+    }
+
     void setDecodeBoundary(uint64_t decodeBoundary)
     {
         m_DecodeBoundary = decodeBoundary;
@@ -179,11 +239,14 @@ private:
     int m_FrameNumber = -1;
     uint32_t m_RtpTimestamp = 0;
     bool m_TimestampValid = false;
+    bool m_DecoderOutputComplete = true;
     uint64_t m_DecoderOutputUs = 0;
     uint64_t m_DecodeCompleteUs = 0;
     uint64_t m_DecodeSyncWaitUs = 0;
     uint64_t m_ReceiveUs = 0;
     uint64_t m_ReassembledUs = 0;
     uint64_t m_DecodeSubmitUs = 0;
+    uint64_t m_DecodeHoldUs = 0;
     uint64_t m_DecodeBoundary = 0;
+    uint32_t m_LostPackets = 0;
 };

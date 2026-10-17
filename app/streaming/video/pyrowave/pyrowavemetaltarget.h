@@ -36,7 +36,7 @@ struct PyroWaveMetalFrameRef {
     uint32_t magic = k_Magic;
     int surface = -1;
     // id<MTLTexture> for Y, Cb and Cr. 10-bit streams use R16Unorm planes
-    // holding full-range 16-bit samples, not 10 bits in the low bits.
+    // holding full-range 16-bit samples (tagged AV_PIX_FMT_YUV4xxP16).
     void* planes[3] = {};
 
     static PyroWaveMetalFrameRef* fromFrame(const AVFrame* frame)

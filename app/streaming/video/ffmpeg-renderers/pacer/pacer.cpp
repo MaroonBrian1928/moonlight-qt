@@ -1,4 +1,5 @@
 #include "pacer.h"
+#include "../../videothreadpriority.h"
 #include "path.h"
 #include <QCryptographicHash>
 #include "vrrpacingworker.h"
@@ -110,6 +111,11 @@ PacerTelemetrySnapshot Pacer::telemetrySnapshot() const
     return m_Telemetry.snapshot();
 }
 
+Overlay::TimingGraphSnapshot Pacer::timingGraphSnapshot() const
+{
+    return m_Telemetry.timingGraphSnapshot(LiGetMicroseconds());
+}
+
 void Pacer::renderOnMainThread()
 {
     if (m_VrrWorker != nullptr) {
@@ -138,11 +144,7 @@ int Pacer::vsyncThread(void *context)
 {
     Pacer* me = reinterpret_cast<Pacer*>(context);
 
-#if SDL_VERSION_ATLEAST(2, 0, 9)
-    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL);
-#else
-    SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH);
-#endif
+    const VideoThreadPriority priority("VSync", VideoThreadPriority::Role::Deadline);
 
     bool async = me->m_VsyncSource->isAsync();
     while (!me->m_Stopping) {
@@ -171,11 +173,7 @@ int Pacer::renderThread(void* context)
 {
     Pacer* me = reinterpret_cast<Pacer*>(context);
 
-    if (SDL_SetThreadPriority(SDL_THREAD_PRIORITY_HIGH) < 0) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "Unable to set render thread to high priority: %s",
-                    SDL_GetError());
-    }
+    const VideoThreadPriority priority("Render");
 
     while (!me->m_Stopping) {
         // Wait for the renderer to be ready for the next frame
@@ -296,7 +294,8 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                        bool enablePacing, bool enableVsync,
                        bool enableVrr, int vrrDisplayRefreshHz,
                        bool smoothVrrFrameTiming, const QString& calibrationKey,
-                       int vrrLatencyMode)
+                       int vrrLatencyMode, VrrTimingOptions vrrTimingOptions,
+                       bool absorbVrrMicrostutter)
 {
     m_MaxVideoFps = maxVideoFps;
     m_RendererAttributes = m_VsyncRenderer->getRendererAttributes();
@@ -309,9 +308,11 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
         // The production queue policy is shared across native backends.
         config.readinessHitchFeedback = false;
         config.latencyMode = vrrLatencyMode >= 0 && vrrLatencyMode <= 2 ? vrrLatencyMode : 1;
+        config.timingOptions = vrrTimingOptions.resolved(config.latencyMode);
         config.streamRateHz = maxVideoFps;
         config.displayRefreshHz = vrrDisplayRefreshHz;
         config.smoothFrameTiming = smoothVrrFrameTiming;
+        config.absorbMicrostutter = smoothVrrFrameTiming && absorbVrrMicrostutter;
         VrrFallbackReason fallbackReason = VrrFallbackReason::NoFallback;
         if (!calibrationKey.isEmpty()) {
             const QString display = QString::fromUtf8(SDL_GetDisplayName(SDL_GetWindowDisplayIndex(window)));
@@ -322,12 +323,33 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
             // Do not seed the shared policy with retired Linux hitch-policy history.
             context += QStringLiteral("|shared-readiness-policy-v18");
 #endif
-            if (config.latencyMode != 0) {
-                context += QStringLiteral("|latency-mode=%1").arg(config.latencyMode);
-            }
+            // Cache by effective values, never by the last selected preset.
+            context += QStringLiteral("|custom-timing-v1=%1-%2-%3-%4")
+                .arg(config.timingOptions.bufferPerMille)
+                .arg(config.timingOptions.targetHundredths)
+                .arg(config.timingOptions.historySeconds)
+                .arg(config.timingOptions.toleranceUs);
             // Preserve the historical V2 calibration identity now that its
             // queue policy is unconditional rather than a live preference.
             context += QStringLiteral("|mean-miss-queue-v2");
+            const auto recoveryPolicy = vrrTimingParametersForSession(config);
+            if (recoveryPolicy.playoutInputHitchMissesOnly)
+                context += QStringLiteral("|input-hitch-misses=%1").arg(recoveryPolicy.playoutInputHitchMissesOnly);
+            if (recoveryPolicy.playoutInputStableAdaptation)
+                context += QStringLiteral("|stable-input-adaptation=%1").arg(recoveryPolicy.playoutInputStableAdaptation);
+            context += QStringLiteral("|late-recovery=%1|buffer-ratio=%2")
+                .arg(recoveryPolicy.playoutLateRecovery)
+                .arg(recoveryPolicy.playoutDelayMaximumPeriodPerMille);
+            if (recoveryPolicy.playoutInputLayerSeedRatioPerMille != 0 ||
+                    recoveryPolicy.playoutCatchupCarryLimitUs != 0) {
+                context += QStringLiteral("|input-learning=%1-%2-%3-%6|carry-limit=%4-%5")
+                    .arg(recoveryPolicy.playoutInputBoundedRecoveryCredit)
+                    .arg(recoveryPolicy.playoutInputLayerSeedRatioPerMille)
+                    .arg(recoveryPolicy.playoutInputLearningTrim)
+                    .arg(recoveryPolicy.playoutCatchupCarryLimitUs)
+                    .arg(recoveryPolicy.playoutCatchupCarryLimitPeriodPerMille)
+                    .arg(recoveryPolicy.playoutInputRecoveryCreditRoomPerMille);
+            }
             if (smoothVrrFrameTiming) {
                 // The saved flag previously selected timestamp-following
                 // playout too. Do not cross-seed its readiness calibration.
@@ -339,6 +361,21 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     .arg(policy.playoutSmoothingWindowedCadence)
                     .arg(policy.playoutSmoothingRecoveryUs);
                 context += QStringLiteral("|catchup=%1").arg(policy.playoutCatchupPerMille);
+                if (policy.playoutSmoothingRecenterPerMille != 0) {
+                    context += QStringLiteral("|recenter=%1").arg(policy.playoutSmoothingRecenterPerMille);
+                }
+                if (policy.playoutSmoothingMaxLagPeriodPerMille != 0) {
+                    context += QStringLiteral("|lag-period=%1").arg(policy.playoutSmoothingMaxLagPeriodPerMille);
+                }
+                if (policy.playoutSmoothingAbsorbReserveUs != 0) {
+                    context += QStringLiteral("|absorb-microstutter=%1-%2")
+                        .arg(policy.playoutSmoothingAbsorbReserveUs)
+                        .arg(policy.playoutSmoothingAbsorbReservePeriodPerMille);
+                }
+                if (policy.playoutSmoothingReadinessBound != 0) {
+                    context += QStringLiteral("|smoothing-readiness-bound=%1")
+                        .arg(policy.playoutSmoothingReadinessBound);
+                }
                 if (policy.playoutSmoothingReserveMaxUs != 0 ||
                         policy.playoutSmoothingPeriodFeedbackPerMillion != 0) {
                     context += QStringLiteral("|smoothing-reserve=%1-%2-%3-%4|period-feedback=%5")
@@ -389,11 +426,14 @@ bool Pacer::initialize(SDL_Window* window, int maxVideoFps,
                     if (m_VrrWorker->start()) {
                         m_DisplayFps = config.displayRefreshHz;
                         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
-                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout, frame timing %s, timing profile %s)",
+                                    "VRR pacing: target %d Hz with %d FPS stream (adaptive timestamp playout, frame timing %s, buffer %.2f frames, target %.2f%%, history %d s, tolerance %.2f ms)",
                                     m_DisplayFps, m_MaxVideoFps,
+                                    config.absorbMicrostutter ? "smoothed, absorbing microstutter" :
                                     config.smoothFrameTiming ? "smoothed" : "follows host timestamps",
-                                    config.latencyMode == 2 ? "low latency" :
-                                    config.latencyMode == 1 ? "balanced target" : "smooth");
+                                    config.timingOptions.bufferPerMille / 1000.0,
+                                    config.timingOptions.targetHundredths / 100.0,
+                                    config.timingOptions.historySeconds,
+                                    config.timingOptions.toleranceUs / 1000.0);
                         return true;
                     }
 

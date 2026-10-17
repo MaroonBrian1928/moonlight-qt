@@ -82,6 +82,7 @@ void SdlGamepadKeyNavigation::disable()
     }
 
     m_Enabled = false;
+    releaseControllerKeys();
     updateTimerState();
     Q_ASSERT(!m_PollingTimer->isActive());
 
@@ -95,6 +96,7 @@ void SdlGamepadKeyNavigation::disable()
 
 void SdlGamepadKeyNavigation::notifyWindowFocus(bool hasFocus)
 {
+    if (!hasFocus) releaseControllerKeys();
     m_HasFocus = hasFocus;
     updateTimerState();
 }
@@ -109,6 +111,7 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
     // Discard any pending button events on the first poll to avoid picking up
     // stale input data from the stream session (like the quit combo).
     if (m_FirstPoll) {
+        releaseControllerKeys();
         SDL_FlushEvent(SDL_CONTROLLERBUTTONDOWN);
         SDL_FlushEvent(SDL_CONTROLLERBUTTONUP);
         m_FirstPoll = false;
@@ -129,6 +132,30 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
             QEvent::Type type =
                     event.type == SDL_CONTROLLERBUTTONDOWN ?
                         QEvent::Type::KeyPress : QEvent::Type::KeyRelease;
+
+            const quint64 buttonId = (quint64(quint32(event.cbutton.which)) << 8) |
+                                      event.cbutton.button;
+            if (type == QEvent::KeyRelease) {
+                // A release after focus reset or an unmatched release must
+                // never become a fresh navigation event in the new context.
+                if (m_PressedControllerKeys.contains(buttonId)) {
+                    const auto key = m_PressedControllerKeys.take(buttonId);
+                    if (key.window) sendKey(type, key.key, key.modifiers, key.window);
+                }
+                break;
+            }
+            // SDL buttons do not repeat. Duplicate downs must not apply a
+            // second adjustment or overwrite the original release route.
+            if (m_PressedControllerKeys.contains(buttonId)) {
+                break;
+            }
+            const auto sendControllerKey = [&](Qt::Key key,
+                                               Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+                auto* target = QGuiApplication::focusWindow();
+                if (!target) return;
+                m_PressedControllerKeys.insert(buttonId, {key, modifiers, target});
+                sendKey(type, key, modifiers, target);
+            };
 
             // Swap face buttons if needed
             if (m_Prefs->swapFaceButtons) {
@@ -152,46 +179,46 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
             case SDL_CONTROLLER_BUTTON_DPAD_UP:
                 if (m_UiNavMode) {
                     // Back-tab
-                    sendKey(type, Qt::Key_Tab, Qt::ShiftModifier);
+                    sendControllerKey(Qt::Key_Tab, Qt::ShiftModifier);
                 }
                 else {
-                    sendKey(type, Qt::Key_Up);
+                    sendControllerKey(Qt::Key_Up);
                 }
                 break;
             case SDL_CONTROLLER_BUTTON_DPAD_DOWN:
                 if (m_UiNavMode) {
-                    sendKey(type, Qt::Key_Tab);
+                    sendControllerKey(Qt::Key_Tab);
                 }
                 else {
-                    sendKey(type, Qt::Key_Down);
+                    sendControllerKey(Qt::Key_Down);
                 }
                 break;
             case SDL_CONTROLLER_BUTTON_DPAD_LEFT:
-                sendKey(type, Qt::Key_Left);
+                sendControllerKey(Qt::Key_Left);
                 break;
             case SDL_CONTROLLER_BUTTON_DPAD_RIGHT:
-                sendKey(type, Qt::Key_Right);
+                sendControllerKey(Qt::Key_Right);
                 break;
             case SDL_CONTROLLER_BUTTON_A:
                 if (m_UiNavMode) {
-                    sendKey(type, Qt::Key_Space);
+                    sendControllerKey(Qt::Key_Space);
                 }
                 else {
-                    sendKey(type, Qt::Key_Return);
+                    sendControllerKey(Qt::Key_Return);
                 }
                 break;
             case SDL_CONTROLLER_BUTTON_B:
-                sendKey(type, Qt::Key_Escape);
+                sendControllerKey(Qt::Key_Escape);
                 break;
             case SDL_CONTROLLER_BUTTON_X:
-                sendKey(type, Qt::Key_Menu);
+                sendControllerKey(Qt::Key_Menu);
                 break;
             case SDL_CONTROLLER_BUTTON_Y:
             case SDL_CONTROLLER_BUTTON_START:
                 // HACK: We use this keycode to inform main.qml
                 // to show the settings when Key_Menu is handled
                 // by the control in focus.
-                sendKey(type, Qt::Key_Hangup);
+                sendControllerKey(Qt::Key_Hangup);
                 break;
             default:
                 break;
@@ -262,10 +289,21 @@ void SdlGamepadKeyNavigation::onPollingTimerFired()
     }
 }
 
-void SdlGamepadKeyNavigation::sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers)
+void SdlGamepadKeyNavigation::releaseControllerKeys()
+{
+    // Clear before dispatch: a receiver may synchronously change focus/mode.
+    const auto pressed = m_PressedControllerKeys;
+    m_PressedControllerKeys.clear();
+    for (const auto& key : pressed) {
+        if (key.window) sendKey(QEvent::KeyRelease, key.key, key.modifiers, key.window);
+    }
+}
+
+void SdlGamepadKeyNavigation::sendKey(QEvent::Type type, Qt::Key key, Qt::KeyboardModifiers modifiers,
+                                     QWindow* target)
 {
     QGuiApplication* app = static_cast<QGuiApplication*>(QGuiApplication::instance());
-    QWindow* focusWindow = app->focusWindow();
+    QWindow* focusWindow = target ? target : app->focusWindow();
     if (focusWindow != nullptr) {
         QKeyEvent keyPressEvent(type, key, modifiers);
         app->sendEvent(focusWindow, &keyPressEvent);

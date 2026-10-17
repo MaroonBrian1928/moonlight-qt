@@ -1,4 +1,5 @@
 #include "computermodel.h"
+#include "onlinecomputerentries.h"
 
 #include <QThreadPool>
 
@@ -13,7 +14,15 @@ void ComputerModel::initialize(ComputerManager* computerManager)
     connect(m_ComputerManager, &ComputerManager::pairingCompleted,
             this, &ComputerModel::handlePairingCompleted);
 
+    beginResetModel();
     m_Computers = m_ComputerManager->getComputers();
+    endResetModel();
+    emit onlineHostsChanged();
+}
+
+QVariantList ComputerModel::onlineHosts() const
+{
+    return onlineComputerEntries(m_Computers);
 }
 
 QVariant ComputerModel::data(const QModelIndex& index, int role) const
@@ -98,6 +107,13 @@ int ComputerModel::rowCount(const QModelIndex& parent) const
     return m_Computers.count();
 }
 
+QString ComputerModel::uuidAt(int computerIndex) const
+{
+    if (computerIndex < 0 || computerIndex >= m_Computers.count()) return {};
+    QReadLocker lock(&m_Computers[computerIndex]->lock);
+    return m_Computers[computerIndex]->uuid;
+}
+
 QHash<int, QByteArray> ComputerModel::roleNames() const
 {
     QHash<int, QByteArray> names;
@@ -147,6 +163,7 @@ void ComputerModel::deleteComputer(int computerIndex)
     m_Computers.removeAt(computerIndex);
 
     endRemoveRows();
+    emit onlineHostsChanged();
 }
 
 class DeferredWakeHostTask : public QRunnable
@@ -240,6 +257,7 @@ void ComputerModel::handleComputerStateChanged(NvComputer* computer)
         int index = m_Computers.indexOf(computer);
         emit dataChanged(createIndex(index, 0), createIndex(index, 0));
     }
+    emit onlineHostsChanged();
 }
 
 #include "computermodel.moc"

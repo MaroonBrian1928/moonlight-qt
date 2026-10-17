@@ -139,7 +139,7 @@ private:
 
 class IVrrFramePresenter;
 class IPyroWaveSurfacePool;
-class IPyroWaveVulkanSurfaces;
+class IPyroWaveVulkanPool;
 class IPyroWaveMetalTarget;
 
 class GpuTrace;
@@ -279,14 +279,14 @@ public:
         return nullptr;
     }
 
-    // Vulkan renderers instead let the PyroWave decoder share their device
-    // and write into their plane images directly.
-    virtual IPyroWaveVulkanSurfaces* getPyroWaveVulkanSurfaces() {
+    // Linux renderers on Vulkan lend planes on their own VkDevice instead
+    // (as does the macOS Metal renderer, through MoltenVK)
+    virtual IPyroWaveVulkanPool* getPyroWaveVulkanPool() {
         return nullptr;
     }
 
-    // Metal renderers lend the native Metal PyroWave decoder their device and
-    // command queue, and sample the textures it decodes into.
+    // Metal renderers lend the opt-in native Metal PyroWave decoder their
+    // device and command queue, and sample the textures it decodes into.
     virtual IPyroWaveMetalTarget* getPyroWaveMetalTarget() {
         return nullptr;
     }

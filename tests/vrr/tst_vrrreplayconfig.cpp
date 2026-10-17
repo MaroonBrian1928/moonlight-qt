@@ -12,12 +12,16 @@ class VrrReplayConfigTest : public QObject
 
 private slots:
     void defaultsRoundTrip();
+    void customToleranceRoundTrip();
+    void inputPercentileToleranceRoundTrip();
     void initialCalibrationPolicyRoundTrip();
     void windowedSmoothingPolicyRoundTrip();
     void judderReservePolicyRoundTrip();
     void offsetRecoveryPolicyRoundTrip();
     void nativeHitchPolicyRoundTrip();
     void displayEventPolicyRoundTrip();
+    void nativeSynchronizationRoundTrip();
+    void nativeSchedulingRoundTrip();
     void submissionEstimatePolicyRoundTrip();
     void predictionOnlyPolicyRoundTrip();
     void rateProtectionPolicyRoundTrip();
@@ -38,6 +42,8 @@ private slots:
     void gpuReadyOperationAudit();
     void gpuReadyStageTimingAudit();
     void presenterSubmissionAudit();
+    void nativeSchedulingAudit();
+    void nativeTargetClockAudit();
     void spacingCorrectionAudit();
     void spacingLifecycleTimingAudit();
     void postPresentQueryTimingAudit();
@@ -49,7 +55,28 @@ private slots:
     void rationalDisplayTiming();
     void busyWorkerReadinessFloor();
     void decodeReadinessOrder();
+    void recordedWorkerQueueCapacity();
 };
+
+void VrrReplayConfigTest::nativeSchedulingRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(0));
+    const auto native = vrrTimingParametersForSession(VrrSessionConfig{}, true, true);
+    QCOMPARE(native.nativeScheduledPresentation, uint64_t(1));
+    QString error;
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(native),
+                                             parameters, error), qPrintable(error));
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(1));
+    auto historical = vrrTimingParametersToJson(native);
+    historical.remove("native_scheduled_presentation");
+    parameters = VrrTimingParameters{};
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(0));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"native_scheduled_presentation", 2}}, parameters, error));
+    QCOMPARE(parameters.nativeScheduledPresentation, uint64_t(0));
+}
 
 void VrrReplayConfigTest::initialCalibrationPolicyRoundTrip()
 {
@@ -81,11 +108,31 @@ void VrrReplayConfigTest::windowedSmoothingPolicyRoundTrip()
     QString error;
     auto production = vrrTimingParametersForSession(VrrSessionConfig{});
     QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(production), parameters, error), qPrintable(error));
-    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(2));
+    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(4));
     QCOMPARE(parameters.playoutSmoothingRecoveryUs, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingMaxLagUs, production.playoutIntervalToleranceUs);
+    QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingResetSlewUs, uint64_t(0));
     QVERIFY(!applyVrrReplayControllerSnapshot(
-        {{"playout_smoothing_windowed_cadence", 3}}, parameters, error));
-    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(2));
+        {{"playout_smoothing_windowed_cadence", 8}}, parameters, error));
+    QCOMPARE(parameters.playoutSmoothingWindowedCadence, uint64_t(4));
+    VrrSessionConfig absorbing;
+    absorbing.absorbMicrostutter = true;
+    VrrTimingParameters absorbed;
+    QVERIFY2(applyVrrReplayControllerSnapshot(
+        vrrTimingParametersToJson(vrrTimingParametersForSession(absorbing)), absorbed, error), qPrintable(error));
+    QCOMPARE(absorbed.playoutSmoothingWindowedCadence, uint64_t(7));
+    QCOMPARE(absorbed.playoutSmoothingResetSlewUs, uint64_t(250));
+    QCOMPARE(absorbed.playoutSmoothingMaxLagUs, uint64_t(1000));
+    QCOMPARE(absorbed.playoutSmoothingReserveMaxUs, uint64_t(0));
+    QCOMPARE(absorbed.playoutSmoothingReservePercentilePerMille, uint64_t(0));
+    QCOMPARE(absorbed.playoutSmoothingAbsorbReserveUs, uint64_t(1000));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_recenter_per_mille", 1001}}, absorbed, error));
+    QCOMPARE(absorbed.playoutSmoothingRecenterPerMille, uint64_t(0));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_max_lag_period_per_mille", 1001}}, absorbed, error));
+    QCOMPARE(absorbed.playoutSmoothingMaxLagPeriodPerMille, uint64_t(0));
     QVERIFY(!applyVrrReplayControllerSnapshot(
         {{"playout_smoothing_recovery_us", 1000001}}, parameters, error));
     QCOMPARE(parameters.playoutSmoothingRecoveryUs, production.playoutSmoothingRecoveryUs);
@@ -103,14 +150,28 @@ void VrrReplayConfigTest::judderReservePolicyRoundTrip()
     VrrTimingParameters parameters;
     QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(0));
     QCOMPARE(parameters.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingReadinessBound, uint64_t(0));
     QString error;
-    const auto production = vrrTimingParametersForSession(VrrSessionConfig{});
+    // Explicit revision-2 snapshot retains the historical reserve contract.
+    auto production = vrrTimingParametersForSession(VrrSessionConfig{});
+    production.playoutSmoothingWindowedCadence = 2;
+    production.playoutSmoothingMaxLagUs = 6000;
+    production.playoutSmoothingReserveMaxUs = 3000;
+    production.playoutSmoothingReserveToleranceUs = 500;
+    production.playoutSmoothingReservePercentilePerMille = 980;
+    production.playoutSmoothingReserveReleaseUsPerSecond = 500;
+    production.playoutSmoothingPeriodFeedbackPerMillion = 20000;
+    production.playoutSmoothingResetSlewUs = 1000;
     QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(production), parameters, error), qPrintable(error));
     QCOMPARE(parameters.playoutSmoothingMaxLagUs, uint64_t(6000));
     QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(3000));
     QCOMPARE(parameters.playoutSmoothingReserveToleranceUs, uint64_t(500));
     QCOMPARE(parameters.playoutSmoothingReservePercentilePerMille, uint64_t(980));
     QCOMPARE(parameters.playoutSmoothingReserveReleaseUsPerSecond, uint64_t(500));
+    QCOMPARE(parameters.playoutSmoothingReadinessBound, uint64_t(1));
+    QVERIFY(vrrReplayParameterNames().contains("controller.playout_smoothing_readiness_bound"));
+    QVERIFY(!applyVrrReplayControllerSnapshot(
+        {{"playout_smoothing_readiness_bound", 2}}, parameters, error));
     QCOMPARE(parameters.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(20000));
     // The reserve shares the positive retiming budget and cannot exceed it.
     QVERIFY(!applyVrrReplayControllerSnapshot(
@@ -132,15 +193,105 @@ void VrrReplayConfigTest::judderReservePolicyRoundTrip()
     historical.remove("playout_smoothing_reserve_percentile_per_mille");
     historical.remove("playout_smoothing_reserve_release_us_per_second");
     historical.remove("playout_smoothing_period_feedback_per_million");
+    historical.remove("playout_smoothing_readiness_bound");
     parameters = VrrTimingParameters{};
     QVERIFY2(applyVrrReplayControllerSnapshot(historical, parameters, error), qPrintable(error));
     QCOMPARE(parameters.playoutSmoothingReserveMaxUs, uint64_t(0));
     QCOMPARE(parameters.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(0));
+    QCOMPARE(parameters.playoutSmoothingReadinessBound, uint64_t(0));
     VrrSessionConfig unchecked;
     unchecked.smoothFrameTiming = false;
     const auto disabled = vrrTimingParametersForSession(unchecked);
     QCOMPARE(disabled.playoutSmoothingReserveMaxUs, uint64_t(0));
     QCOMPARE(disabled.playoutSmoothingPeriodFeedbackPerMillion, uint64_t(0));
+    QCOMPARE(disabled.playoutSmoothingReadinessBound, uint64_t(0));
+}
+
+void VrrReplayConfigTest::customToleranceRoundTrip()
+{
+    VrrTimingParameters policy;
+    QString error;
+    QCOMPARE(policy.playoutIntervalToleranceUs, uint64_t(0));
+    for (int tolerance = 250; tolerance <= 2000; tolerance += 250) {
+        QVERIFY2(applyVrrReplayControllerSnapshot(
+            {{"playout_interval_tolerance_us", tolerance}}, policy, error), qPrintable(error));
+        VrrTimingParameters restored;
+        QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(policy), restored, error), qPrintable(error));
+        QCOMPARE(restored.playoutIntervalToleranceUs, uint64_t(tolerance));
+    }
+    for (int tolerance : {1, 200, 251, 2001}) {
+        QVERIFY(!applyVrrReplayControllerSnapshot(
+            {{"playout_interval_tolerance_us", tolerance}}, policy, error));
+        QCOMPARE(policy.playoutIntervalToleranceUs, uint64_t(2000));
+    }
+    auto historical = vrrTimingParametersToJson(policy);
+    historical.remove("playout_interval_tolerance_us");
+    VrrTimingParameters restored;
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, restored, error), qPrintable(error));
+    QCOMPARE(restored.playoutIntervalToleranceUs, uint64_t(0));
+}
+
+void VrrReplayConfigTest::inputPercentileToleranceRoundTrip()
+{
+    VrrTimingParameters policy;
+    QString error;
+    QCOMPARE(policy.playoutInputHitchMissesOnly, uint64_t(0));
+    VrrSessionConfig inputSession;
+    inputSession.experimentalInputPercentilePpm = 1;
+    auto production = vrrTimingParametersForSession(inputSession);
+    QCOMPARE(production.playoutInputHitchMissesOnly, uint64_t(10));
+    QCOMPARE(policy.playoutInputStableAdaptation,uint64_t(0));
+    QCOMPARE(production.playoutInputStableAdaptation,uint64_t(1));
+    VrrTimingParameters hitchPolicy;
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(production), hitchPolicy, error), qPrintable(error));
+    QCOMPARE(hitchPolicy.playoutInputHitchMissesOnly, uint64_t(10));
+    QCOMPARE(hitchPolicy.playoutInputStableAdaptation,uint64_t(1));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_input_stable_adaptation",2}},hitchPolicy,error));
+    QCOMPARE(hitchPolicy.playoutInputStableAdaptation,uint64_t(1));
+    QVERIFY(applyVrrReplayControllerSnapshot({{"playout_input_hitch_misses_only", 6}}, hitchPolicy, error));
+    QCOMPARE(hitchPolicy.playoutInputHitchMissesOnly, uint64_t(6));
+    QVERIFY(applyVrrReplayControllerSnapshot({{"playout_input_hitch_misses_only", 7}}, hitchPolicy, error));
+    QCOMPARE(hitchPolicy.playoutInputHitchMissesOnly, uint64_t(7));
+    QVERIFY(applyVrrReplayControllerSnapshot({{"playout_input_hitch_misses_only", 8}}, hitchPolicy, error));
+    QCOMPARE(hitchPolicy.playoutInputHitchMissesOnly, uint64_t(8));
+    QVERIFY(applyVrrReplayControllerSnapshot({{"playout_input_hitch_misses_only", 9}}, hitchPolicy, error));
+    QCOMPARE(hitchPolicy.playoutInputHitchMissesOnly, uint64_t(9));
+    QVERIFY(applyVrrReplayControllerSnapshot({{"playout_input_hitch_misses_only", 10}}, hitchPolicy, error));
+    QCOMPARE(hitchPolicy.playoutInputHitchMissesOnly, uint64_t(10));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_input_hitch_misses_only", 11}}, hitchPolicy, error));
+    QCOMPARE(hitchPolicy.playoutInputHitchMissesOnly, uint64_t(10));
+    auto oldSnapshot = vrrTimingParametersToJson(production);
+    oldSnapshot.remove("playout_input_hitch_misses_only");
+    oldSnapshot.remove("playout_input_stable_adaptation");
+    VrrTimingParameters oldPolicy;
+    QVERIFY2(applyVrrReplayControllerSnapshot(oldSnapshot, oldPolicy, error), qPrintable(error));
+    QCOMPARE(oldPolicy.playoutInputHitchMissesOnly, uint64_t(0));
+    QCOMPARE(oldPolicy.playoutInputStableAdaptation,uint64_t(0));
+    QCOMPARE(policy.playoutInputPercentileToleranceUs, uint64_t(0));
+    for (int tolerance = 250; tolerance <= 2000; tolerance += 250) {
+        QVERIFY2(applyVrrReplayControllerSnapshot(
+            {{"playout_input_percentile_tolerance_us", tolerance}}, policy, error), qPrintable(error));
+        VrrTimingParameters restored;
+        const auto snapshot = vrrTimingParametersToJson(policy);
+        QCOMPARE(snapshot.value("playout_input_percentile_tolerance_us").toInt(), tolerance);
+        QVERIFY2(applyVrrReplayControllerSnapshot(snapshot, restored, error), qPrintable(error));
+        QCOMPARE(restored.playoutInputPercentileToleranceUs, uint64_t(tolerance));
+    }
+    for (int tolerance : {1, 249, 251, 1999, 2001, 2250}) {
+        QVERIFY(!applyVrrReplayControllerSnapshot(
+            {{"playout_input_percentile_tolerance_us", tolerance}}, policy, error));
+        QCOMPARE(policy.playoutInputPercentileToleranceUs, uint64_t(2000));
+    }
+    auto historical = vrrTimingParametersToJson(policy);
+    historical.remove("playout_input_percentile_tolerance_us");
+    historical["playout_interval_tolerance_us"] = 750;
+    VrrTimingParameters restored;
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, restored, error), qPrintable(error));
+    QCOMPARE(restored.playoutIntervalToleranceUs, uint64_t(750));
+    QCOMPARE(restored.playoutInputPercentileToleranceUs, uint64_t(0));
+    QVERIFY2(applyVrrReplayControllerSnapshot(
+        {{"playout_input_percentile_tolerance_us", 0}}, policy, error), qPrintable(error));
+    QCOMPARE(policy.playoutInputPercentileToleranceUs, uint64_t(0));
 }
 
 void VrrReplayConfigTest::defaultsRoundTrip()
@@ -295,7 +446,17 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QCOMPARE(restored.playoutOffsetMaximumStepUs, uint64_t(100));
     QCOMPARE(restored.playoutSourceMappingDecoderOutput, uint64_t(0));
     QCOMPARE(restored.playoutSerialServiceGate, uint64_t(2));
-    QCOMPARE(restored.playoutRecentPressureRelease, uint64_t(2));
+    QCOMPARE(restored.playoutRecentPressureRelease, uint64_t(3));
+    QCOMPARE(restored.playoutHoldRenewBelowTarget, uint64_t(3));
+    QCOMPARE(restored.playoutLateRecovery, uint64_t(1));
+    QCOMPARE(restored.playoutCatchupPerMille, uint64_t(20));
+    QVERIFY(vrrReplayParameterNames().contains("controller.playout_late_recovery"));
+    auto invalidRecovery = restored;
+    invalidRecovery.playoutLateRecovery = 2;
+    QVERIFY(!validateVrrTimingParameters(invalidRecovery, error));
+    invalidRecovery = restored;
+    invalidRecovery.playoutCatchupPerMille = 0;
+    QVERIFY(!validateVrrTimingParameters(invalidRecovery, error));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_cadence_gate"));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_slew_us_per_second"));
     QVERIFY(vrrReplayParameterNames().contains("controller.playout_offset_source_clock"));
@@ -315,7 +476,9 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     oldSnapshot.remove("playout_source_mapping_decoder_output");
     oldSnapshot.remove("playout_serial_service_gate");
     oldSnapshot.remove("playout_recent_pressure_release");
+    oldSnapshot.remove("playout_hold_renew_below_target");
     oldSnapshot.remove("playout_catchup_per_mille");
+    oldSnapshot.remove("playout_late_recovery");
     VrrTimingParameters historical;
     QVERIFY2(applyVrrReplayControllerSnapshot(oldSnapshot, historical, error), qPrintable(error));
     QCOMPARE(historical.playoutOffsetCadenceGate, uint64_t(0));
@@ -325,7 +488,9 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     QCOMPARE(historical.playoutSourceMappingDecoderOutput, uint64_t(0));
     QCOMPARE(historical.playoutSerialServiceGate, uint64_t(0));
     QCOMPARE(historical.playoutRecentPressureRelease, uint64_t(0));
+    QCOMPARE(historical.playoutHoldRenewBelowTarget, uint64_t(0));
     QCOMPARE(historical.playoutCatchupPerMille, uint64_t(0));
+    QCOMPARE(historical.playoutLateRecovery, uint64_t(0));
 
     auto revisionOneSnapshot = snapshot;
     revisionOneSnapshot["playout_serial_service_gate"] = 1;
@@ -362,6 +527,18 @@ void VrrReplayConfigTest::offsetRecoveryPolicyRoundTrip()
     invalid.playoutRecentPressureRelease = 2;
     QVERIFY(validateVrrTimingParameters(invalid, error));
     invalid.playoutRecentPressureRelease = 3;
+    QVERIFY(validateVrrTimingParameters(invalid, error));
+    invalid.playoutRecentPressureRelease = 4;
+    QVERIFY(!validateVrrTimingParameters(invalid, error));
+    for (uint64_t revision = 0; revision <= 3; ++revision) {
+        auto holdSnapshot = snapshot;
+        holdSnapshot["playout_hold_renew_below_target"] = int(revision);
+        QVERIFY2(applyVrrReplayControllerSnapshot(holdSnapshot, historical, error),
+                 qPrintable(error));
+        QCOMPARE(historical.playoutHoldRenewBelowTarget, revision);
+    }
+    invalid = restored;
+    invalid.playoutHoldRenewBelowTarget = 4;
     QVERIFY(!validateVrrTimingParameters(invalid, error));
 }
 
@@ -712,13 +889,14 @@ void VrrReplayConfigTest::predictionOnlyPolicyRoundTrip()
     QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(4));
     QVERIFY(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 5}}, responsive, error));
     QCOMPARE(responsive.playoutResponsiveBuffer, uint64_t(5));
-    for (int revision : {6, 7, 8}) {
+    for (int revision : {6, 7, 8, 9, 10, 11, 12}) {
         QVERIFY2(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", revision}}, responsive, error), qPrintable(error));
         auto restored = VrrTimingParameters{};
         QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(responsive), restored, error), qPrintable(error));
         QCOMPARE(restored.playoutResponsiveBuffer, uint64_t(revision));
     }
-    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 9}}, responsive, error));
+    QVERIFY(applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 12}}, responsive, error));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_responsive_buffer", 13}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_on_time_target_per_million", 1000001}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 300100000}}, responsive, error));
     QVERIFY(!applyVrrReplayControllerSnapshot({{"playout_readiness_window_us", 300000001}}, responsive, error));
@@ -845,6 +1023,23 @@ void VrrReplayConfigTest::displayEventPolicyRoundTrip()
     snapshot["playout_require_display_events"] = 2;
     QVERIFY(!applyVrrReplayControllerSnapshot(snapshot, parameters, error));
     QCOMPARE(parameters.playoutRequireDisplayEvents, uint64_t(1));
+}
+
+void VrrReplayConfigTest::nativeSynchronizationRoundTrip()
+{
+    VrrTimingParameters parameters;
+    QCOMPARE(parameters.nativeSynchronizedPresentation, uint64_t(0));
+    QString error;
+    const auto native = vrrTimingParametersForSession(VrrSessionConfig{}, true);
+    QVERIFY2(applyVrrReplayControllerSnapshot(vrrTimingParametersToJson(native), parameters, error), qPrintable(error));
+    QCOMPARE(parameters.nativeSynchronizedPresentation, uint64_t(1));
+    QVERIFY(!applyVrrReplayControllerSnapshot({{"native_synchronized_presentation", 2}}, parameters, error));
+    QCOMPARE(parameters.nativeSynchronizedPresentation, uint64_t(1));
+    auto historical = vrrTimingParametersToJson(native);
+    historical.remove("native_synchronized_presentation");
+    parameters = VrrTimingParameters{};
+    QVERIFY2(applyVrrReplayControllerSnapshot(historical, parameters, error), qPrintable(error));
+    QCOMPARE(parameters.nativeSynchronizedPresentation, uint64_t(0));
 }
 
 void VrrReplayConfigTest::submissionEstimatePolicyRoundTrip()
@@ -1902,6 +2097,55 @@ void VrrReplayConfigTest::presenterSubmissionAudit()
     QVERIFY(audit.relationshipValid);
 }
 
+void VrrReplayConfigTest::nativeSchedulingAudit()
+{
+    auto audit = evaluateVrrNativeScheduling(false, true, false,
+                                              1000, 0, 1000);
+    QVERIFY(audit.relationshipValid);
+    QCOMPARE(audit.expectedSchedulingBoundaryUs, uint64_t(1000));
+    audit = evaluateVrrNativeScheduling(true, true, false,
+                                       1000, 3000, 3000);
+    QVERIFY(audit.relationshipValid);
+    QCOMPARE(audit.expectedSchedulingBoundaryUs, uint64_t(3000));
+    // A late enqueue retains its actual CPU time, never moving backwards to
+    // a requested display deadline which has already passed.
+    QVERIFY(evaluateVrrNativeScheduling(true, true, false,
+                                        4000, 3000, 4000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, false,
+                                         1000, 3000, 1000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, false,
+                                         1000, 0, 1000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(false, true, false,
+                                         1000, 3000, 3000).relationshipValid);
+    // Failure or cancellation cannot install a future cadence boundary.
+    QVERIFY(evaluateVrrNativeScheduling(true, false, false,
+                                        0, 0, 0).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, false, false,
+                                         0, 3000, 0).relationshipValid);
+    QVERIFY(evaluateVrrNativeScheduling(true, true, true,
+                                        1000, 0, 1000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, true,
+                                         1000, 0, 3000).relationshipValid);
+    QVERIFY(!evaluateVrrNativeScheduling(true, true, true,
+                                         1000, 3000, 1000).relationshipValid);
+}
+
+void VrrReplayConfigTest::nativeTargetClockAudit()
+{
+    auto audit = evaluateVrrNativeTargetClock(3000, 119900, 100000, 1000, 1020, 11);
+    QVERIFY(audit.relationshipValid);
+    QCOMPARE(audit.expectedTarget100ns, uint64_t(119900));
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 100000, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 119900, 100000, 1000, 1020, 0).relationshipValid);
+    QVERIFY(evaluateVrrNativeTargetClock(1000, 100000, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(1000, 183330, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 119900, 100000, 1000, 1501, 252).relationshipValid);
+    QVERIFY(!evaluateVrrNativeTargetClock(3000, 119900, 0, 1000, 1020, 11).relationshipValid);
+    constexpr auto max = (std::numeric_limits<uint64_t>::max)();
+    QVERIFY(!evaluateVrrNativeTargetClock(max, 100000, 100000, 1000, 1020, 11).relationshipValid);
+    QVERIFY(evaluateVrrNativeTargetClock(1011, max, max - 10, 1000, 1020, 11).relationshipValid);
+}
+
 void VrrReplayConfigTest::spacingCorrectionAudit()
 {
     QVERIFY(evaluateVrrSpacingCorrection(
@@ -2383,6 +2627,34 @@ void VrrReplayConfigTest::decodeReadinessOrder()
         1000, 2100, 1020, 1030, 2210, 1100, true, true, true));
     QVERIFY(vrrDecodeReadinessOrderValid(
         1000, 1000, 1020, 1030, 1040, 200, true, true, true));
+    // The explicit observation flag permits both short waits and already-ready
+    // GPU fences without weakening validation of historical captures.
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 6888, 1020, 6803, 6890, 83, true, true, true, true));
+    QVERIFY(vrrDecodeReadinessOrderValid(
+        1000, 6803, 1020, 6803, 6805, 0, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 1000, 1020, 6803, 6890, 83, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 6888, 1020, 6803, 6880, 83, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 6888, 1020, 6803, 6890, 90, true, true, true, true));
+    QVERIFY(!vrrDecodeReadinessOrderValid(
+        1000, 1000, 1020, 0, 0, 0, false, true, true, true));
+}
+
+void VrrReplayConfigTest::recordedWorkerQueueCapacity()
+{
+    for (uint64_t configured : {0ULL, 1ULL, 3ULL, 4ULL, 5ULL}) {
+        VrrTimingParameters parameters;
+        parameters.playoutQueueFrames = configured;
+        VrrTimingController controller(VrrSessionConfig{}, false, parameters);
+        QCOMPARE(vrrRecordedWorkerQueueCapacity(configured),
+                 uint64_t(controller.queuedFrameCapacity()));
+    }
+    QCOMPARE(vrrRecordedWorkerQueueCapacity(0), uint64_t(3));
+    QCOMPARE(vrrRecordedWorkerQueueCapacity(4), uint64_t(4));
+    QVERIFY(uint64_t(5) > vrrRecordedWorkerQueueCapacity(4));
 }
 
 QTEST_APPLESS_MAIN(VrrReplayConfigTest)

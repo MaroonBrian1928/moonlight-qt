@@ -4,9 +4,23 @@ TEMPLATE = subdirs
 CONFIG += ordered
 
 contains(CONFIG, tests) {
+    SUBDIRS += updates
     SUBDIRS += vrr
     SUBDIRS += haptics
     SUBDIRS += pyrowave
+    toleranceInput.file = $$PWD/input/tolerance.pro
+    SUBDIRS += toleranceInput
+    gamepadStickMerge.file = $$PWD/input/gamepadstickmerge.pro
+    SUBDIRS += gamepadStickMerge
+    calibrationHosts.file = $$PWD/qml/calibration-hosts.pro
+    SUBDIRS += calibrationHosts
+    macx {
+        controllerNavigation.file = $$PWD/qml/controller-navigation.pro
+        SUBDIRS += controllerNavigation
+    } else:unix:packagesExist(sdl2) {
+        controllerNavigation.file = $$PWD/qml/controller-navigation.pro
+        SUBDIRS += controllerNavigation
+    }
 } else {
     message(VRR tests are disabled; rerun qmake with CONFIG+=tests)
 }

@@ -56,7 +56,7 @@ win32 {
     }
 
     INCLUDEPATH += $$PWD/../libs/windows/include
-    LIBS += dcomp.lib advapi32.lib ws2_32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib hid.lib
+    LIBS += dcomp.lib advapi32.lib cfgmgr32.lib ws2_32.lib iphlpapi.lib shell32.lib winmm.lib dxva2.lib ole32.lib gdi32.lib user32.lib d3d9.lib dwmapi.lib dbghelp.lib hid.lib
 }
 macx:!disable-prebuilts {
     !exists($$PWD/../libs/mac) {
@@ -180,6 +180,7 @@ SOURCES += \
     backend/identitymanager.cpp \
     backend/nvcomputer.cpp \
     backend/nvhttp.cpp \
+    backend/pyrowaveudpprobe.cpp \
     backend/nvpairingmanager.cpp \
     backend/computermanager.cpp \
     backend/boxartmanager.cpp \
@@ -203,6 +204,7 @@ SOURCES += \
     streaming/input/mouse.cpp \
     streaming/input/reltouch.cpp \
     streaming/session.cpp \
+    streaming/gpuperformancehold.cpp \
     streaming/gamescopecomposition.cpp \
     streaming/audio/audio.cpp \
     streaming/audio/renderers/sdlaud.cpp \
@@ -216,11 +218,16 @@ SOURCES += \
     gui/sdlgamepadkeynavigation.cpp \
     streaming/video/overlaymanager.cpp \
     streaming/vrrratepolicy.cpp \
+    streaming/video/pyrowave/pyrowavecalibrator.cpp \
     backend/systemproperties.cpp \
+    backend/networkbuffers.cpp \
     wm.cpp
 
 HEADERS += \
+    streaming/video/videothreadpriority.h \
+    streaming/video/timinggraph.h \
     streaming/input/dualsensehid.h \
+    streaming/input/gamepadstickmerge.h \
     streaming/input/dualsensetriggers.h \
     ../third-party/saxense/packet.h \
     SDL_compat.h \
@@ -235,6 +242,7 @@ HEADERS += \
     backend/nvcomputer.h \
     backend/framelimitercapabilities.h \
     backend/nvhttp.h \
+    backend/pyrowaveudpprobe.h \
     backend/nvpairingmanager.h \
     backend/computermanager.h \
     backend/boxartmanager.h \
@@ -244,17 +252,25 @@ HEADERS += \
     cli/quitstream.h \
     cli/startstream.h \
     settings/streamingpreferences.h \
+    settings/vrrtimingoptions.h \
     diagnostics/diagnosticcapture.h \
     diagnostics/gputrace.h \
     diagnostics/diagnosticzip.h \
     streaming/input/dualsensehaptics.h \
     streaming/input/input.h \
     streaming/session.h \
+    streaming/gpuperformancehold.h \
     streaming/video/amddecodepolicy.h \
+    streaming/video/pyrowave/pyrowavecalibrator.h \
+    streaming/video/pyrowave/pyrowavecalibrationpolicy.h \
+    streaming/video/pyrowave/pyrowavebandwidth.h \
+    streaming/video/pyrowave/pyrowavelinkpolicy.h \
+    streaming/video/pyrowave/pyrowavebitrate.h \
     streaming/gamescopecomposition.h \
     streaming/audio/renderers/renderer.h \
     streaming/audio/renderers/sdl.h \
     gui/computermodel.h \
+    gui/onlinecomputerentries.h \
     gui/appmodel.h \
     streaming/video/decoder.h \
     streaming/vrrratepolicy.h \
@@ -266,7 +282,9 @@ HEADERS += \
     gui/sdlgamepadkeynavigation.h \
     streaming/video/overlaymanager.h \
     streaming/video/clientpacingwarning.h \
+    streaming/video/pyrowave/pyrowavepacketlosswarning.h \
     backend/systemproperties.h \
+    backend/networkbuffers.h \
     windowsvblankvirtualization.h
 
 # Platform-specific renderers and decoders
@@ -296,6 +314,9 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
@@ -303,8 +324,13 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputlayercadence.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputcoveragehistory.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/extrabufferslew.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/sourcegapsmoothing.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrcatchup.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/receivedeadline.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h
 }
 libva {
@@ -456,11 +482,14 @@ win32:!winrt {
         streaming/video/ffmpeg-renderers/dxva2.h \
         streaming/video/ffmpeg-renderers/d3d11va.h \
         streaming/video/ffmpeg-renderers/d3d11composition.h \
+        streaming/video/ffmpeg-renderers/compositionpresentpolicy.h \
         streaming/video/ffmpeg-renderers/d3d11pyrowave.h \
         streaming/video/pyrowave/pyrowavesurfaces.h \
         streaming/video/ffmpeg-renderers/presentationclock.h \
         streaming/video/ffmpeg-renderers/dxgipresent.h \
+        streaming/video/ffmpeg-renderers/dxgiwaitable.h \
         streaming/video/ffmpeg-renderers/d3d11fencewait.h \
+        streaming/video/ffmpeg-renderers/d3d11presentpolicy.h \
         streaming/video/ffmpeg-renderers/pacer/dxvsyncsource.h
 }
 macx {
@@ -469,10 +498,12 @@ macx {
     SOURCES += \
         streaming/video/ffmpeg-renderers/vt_base.mm \
         streaming/video/ffmpeg-renderers/vt_avsamplelayer.mm \
-        streaming/video/ffmpeg-renderers/vt_metal.mm
+        streaming/video/ffmpeg-renderers/vt_metal.mm \
+        streaming/video/ffmpeg-renderers/macdisplaytiming.mm
 
     HEADERS += \
-        streaming/video/ffmpeg-renderers/vt.h
+        streaming/video/ffmpeg-renderers/vt.h \
+        streaming/video/ffmpeg-renderers/macdisplaytiming.h
 }
 discord-rpc {
     message(Discord integration enabled)
@@ -516,18 +547,48 @@ wayland {
     HEADERS += streaming/video/ffmpeg-renderers/waylandfeedback/wayland.h
     HEADERS += streaming/video/ffmpeg-renderers/pacer/waylandvsyncsource.h
 }
+# Keeps KWin able to scan a fullscreen stream out directly. It loads
+# libwayland-client at runtime and reads KMS state with ioctls, so it is also
+# built where Wayland and libdrm linking are disabled (the AppImage).
+linux:!disable-kwin-scanout-guard:packagesExist(wayland-client) {
+    message(KWin scanout guard enabled)
+
+    DEFINES += HAVE_KWIN_SCANOUT_GUARD
+    SOURCES += streaming/kwinscanoutguard.cpp \
+               streaming/video/ffmpeg-renderers/protocols/kde-output-device-v2-protocol.c \
+               streaming/video/ffmpeg-renderers/protocols/kde-output-management-v2-protocol.c
+    HEADERS += streaming/kwinscanoutguard.h \
+               streaming/video/ffmpeg-renderers/protocols/kde-output-device-v2-client-protocol.h \
+               streaming/video/ffmpeg-renderers/protocols/kde-output-management-v2-client-protocol.h
+    QMAKE_CFLAGS += $$system(pkg-config --cflags wayland-client)
+    QMAKE_CXXFLAGS += $$system(pkg-config --cflags wayland-client)
+    LIBS += -ldl
+    qtHaveModule(dbus) {
+        QT += dbus
+        DEFINES += HAVE_QTDBUS
+    }
+}
 !disable-h264bitstream {
     DEFINES += HAVE_H264BITSTREAM
 }
 
-# PyroWave decoding (Vulkan compute) writes into the D3D11 renderer's textures
-# on Windows and into the libplacebo renderer's on macOS (MoltenVK). Granite has
-# no MSVC ARM64 SIMD path.
-if(win32:!winrt:contains(QT_ARCH, x86_64)|macx):!disable-pyrowave {
+# PyroWave decoding runs on Vulkan. Windows shares D3D11 surfaces; Linux
+# presents the decoded planes through libplacebo. macOS exports MoltenVK images
+# as Metal textures so decoding and presentation share the same GPU planes.
+win32:!winrt:contains(QT_ARCH, x86_64):!disable-pyrowave {
     message(PyroWave decoder enabled)
     CONFIG += pyrowave
 }
+linux:contains(QT_ARCH, x86_64):!disable-pyrowave:contains(CONFIG, libplacebo) {
+    message(PyroWave decoder enabled)
+    CONFIG += pyrowave
+}
+macx:!disable-prebuilts:!disable-pyrowave {
+    message(PyroWave decoder enabled via MoltenVK and Metal)
+    CONFIG += pyrowave
+}
 pyrowave {
+    include($$PWD/../pyrowave/compression/compression.pri)
     DEFINES += HAVE_PYROWAVE
 
     SOURCES += \
@@ -535,13 +596,18 @@ pyrowave {
         streaming/video/pyrowave/pyrowaveframing.cpp
     HEADERS += \
         streaming/video/pyrowave/pyrowavedecoder.h \
+        streaming/video/pyrowave/pyrowaveframedecoder.h \
         streaming/video/pyrowave/pyrowaveframing.h \
-        streaming/video/pyrowave/pyrowavesurfaces.h \
-        streaming/video/pyrowave/pyrowavevulkansurfaces.h
-
-    libplacebo {
-        SOURCES += streaming/video/ffmpeg-renderers/plvkpyrowave.cpp
-        HEADERS += streaming/video/ffmpeg-renderers/plvkpyrowave.h
+        streaming/video/pyrowave/pyrowavesurfaces.h
+    linux {
+        SOURCES += streaming/video/pyrowave/pyrowaveplacebo.cpp
+        HEADERS += streaming/video/pyrowave/pyrowaveplacebo.h
+    }
+    macx {
+        SOURCES += streaming/video/pyrowave/pyrowavemetal.mm \
+                   streaming/video/pyrowave/pyrowavemetalcalibrator.mm
+        HEADERS += streaming/video/pyrowave/pyrowavemetal.h \
+                   streaming/video/pyrowave/pyrowavemetalcalibrator.h
     }
 
     # Only pyrowave.h is included from the vendored tree
@@ -552,20 +618,16 @@ pyrowave {
     else:unix: LIBS += -L$$OUT_PWD/../pyrowave/ -lpyrowave
     win32: LIBS += -luser32
 
-    # On Apple Silicon the native Metal port decodes into the Metal renderer's
-    # textures; the Vulkan (MoltenVK) path remains the fallback
+    # Opt-in on Apple Silicon (PYROWAVE_BACKEND=metal): the native Metal port
+    # decodes into the Metal renderer's textures. MoltenVK stays the default.
     macx {
         DEFINES += HAVE_PYROWAVE_METAL
         SOURCES += streaming/video/pyrowave/pyrowavemetaldecoder.mm
         HEADERS += \
-            streaming/video/pyrowave/pyrowaveframedecoder.h \
             streaming/video/pyrowave/pyrowavemetaldecoder.h \
             streaming/video/pyrowave/pyrowavemetaltarget.h
         INCLUDEPATH += $$PWD/../pyrowave-metal
         LIBS += -L$$OUT_PWD/../pyrowave-metal/ -lpyrowave-metal -framework IOSurface
-    }
-    else {
-        HEADERS += streaming/video/pyrowave/pyrowaveframedecoder.h
     }
 }
 
@@ -698,10 +760,11 @@ macx {
     }
 }
 
-# Displayed version stays CI_VERSION (e.g. 6.1.0-vrr17.1). Windows PE/MSI
+# Displayed version stays CI_VERSION (e.g. 6.2.0-daily.183). Windows PE/MSI
 # ProductVersion can only use three numeric fields and must increase past
 # stock Moonlight 6.1.0, so VRR builds map 6.1.0-vrrN to 6.2.N and
 # 6.1.0-vrrN.P to 6.2.(N*10+P).
+# Both 6.1.0-daily.B and 6.2.0-daily.B retain Windows 6.2.B; never reset B.
 VERSION = "$$BASE_VERSION"
 PE_VERSION = $$(MOONLIGHT_PE_VERSION)
 !isEmpty(PE_VERSION) {
@@ -710,3 +773,6 @@ PE_VERSION = $$(MOONLIGHT_PE_VERSION)
 DEFINES += VERSION_STR=\\\"$$MOONLIGHT_VERSION\\\"
 
 SOURCES += $$PWD/streaming/video/ffmpeg-renderers/pacer/vrr/profile.cpp
+
+# Compact presentation-only stats formatter.
+HEADERS += streaming/video/performancestats.h

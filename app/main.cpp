@@ -55,6 +55,8 @@
 #include "backend/systemproperties.h"
 #include "streaming/session.h"
 #include "settings/streamingpreferences.h"
+#include "streaming/video/pyrowave/pyrowavecalibrator.h"
+#include "backend/networkbuffers.h"
 #include "gui/sdlgamepadkeynavigation.h"
 #include "windowsvblankvirtualization.h"
 
@@ -436,6 +438,14 @@ void configureSignalHandlers()
 
 int main(int argc, char *argv[])
 {
+    if (argc == 2 && strcmp(argv[1], "--lz4-license") == 0) {
+        QFile file(QStringLiteral(":/licenses/LZ4.txt"));
+        if (!file.open(QIODevice::ReadOnly)) return 1;
+        const auto contents = file.readAll();
+        if (fwrite(contents.constData(), 1, size_t(contents.size()), stdout) != size_t(contents.size())) return 1;
+        return fflush(stdout) == 0 ? 0 : 1;
+    }
+
     // Available headlessly from every package; includes the exact covered source.
     if (argc == 2 && strcmp(argv[1], "--haptics-license") == 0) {
         for (const char* name : {"PROVENANCE.md", "LICENSE-MPL-2.0", "LICENSE-GPL-3.0", "SAxense.c", "packet.h", "README.md"}) {
@@ -909,6 +919,19 @@ int main(int argc, char *argv[])
 
     // Apply the initial translation based on user preference
     StreamingPreferences::get()->retranslate();
+    // Read-only launch verification: resolve actual saved preferences, then exit
+    // before creating the window, computer manager or any streaming session.
+    if (qEnvironmentVariable("MOONLIGHT_VRR_REPORT_PROFILE") == "1") {
+        const auto* preferences = StreamingPreferences::get();
+        const auto options = preferences->vrrTimingOptions().resolved(preferences->vrrLatencyMode);
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+            "Effective VRR profile: mode=%d target_basis_points=%d smoothness=%.2f%% input_percentile_ppm=%llu history_seconds=%d adaptive=%d; session snapshot, changes apply to next stream",
+            preferences->vrrLatencyMode, options.targetHundredths, options.targetHundredths / 100.0,
+            static_cast<unsigned long long>(uint64_t(options.targetHundredths) * 100), options.historySeconds,
+            qEnvironmentVariable("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER") != "0");
+        return 0;
+    }
+
 
     // Trickily declare the translation for dialog buttons
     QCoreApplication::translate("QPlatformTheme", "&Yes");
@@ -1010,6 +1033,16 @@ int main(int argc, char *argv[])
                                                    [](QQmlEngine* qmlEngine, QJSEngine*) -> QObject* {
                                                        return StreamingPreferences::get(qmlEngine);
                                                    });
+    qmlRegisterSingletonType<PyroWaveCalibrator>("PyroWaveCalibrator", 1, 0,
+                                                  "PyroWaveCalibrator",
+                                                  [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                      return new PyroWaveCalibrator();
+                                                  });
+    qmlRegisterSingletonType<NetworkBuffers>("NetworkBuffers", 1, 0,
+                                             "NetworkBuffers",
+                                             [](QQmlEngine*, QJSEngine*) -> QObject* {
+                                                 return new NetworkBuffers();
+                                             });
 
     // Create the identity manager on the main thread
     IdentityManager::get();

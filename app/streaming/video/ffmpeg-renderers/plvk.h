@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <deque>
+#include <mutex>
 #include <QMutex>
 #include <QWaitCondition>
 
@@ -23,8 +24,8 @@
 #include "vulkantiming.h"
 #endif
 
-#ifdef HAVE_PYROWAVE
-#include "plvkpyrowave.h"
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+#include "streaming/video/pyrowave/pyrowaveplacebo.h"
 #endif
 
 #ifdef HAS_WAYLAND
@@ -97,8 +98,8 @@ public:
     virtual int getDecoderCapabilities() override;
     virtual bool isPixelFormatSupported(int videoFormat, enum AVPixelFormat pixelFormat) override;
     virtual AVPixelFormat getPreferredPixelFormat(int videoFormat) override;
-#ifdef HAVE_PYROWAVE
-    virtual IPyroWaveVulkanSurfaces* getPyroWaveVulkanSurfaces() override { return m_PyroWaveSurfaces.get(); }
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+    IPyroWaveVulkanPool* getPyroWaveVulkanPool() override { return m_PyroWavePool.get(); }
 #endif
 
 private:
@@ -119,6 +120,7 @@ private:
     bool acquirePendingSwapchainFrame(const char* earlyRenderFailureMessage);
     bool acquireVrrSwapchainFrame();
     bool submitPendingSwapchainFrame();
+    bool submitSwapchainFrame();
     void finishVrrRenderTiming();
     bool cancelVrrFrame();
     bool waitForVrrGpuReady(VrrPresentFeedback& feedback);
@@ -127,7 +129,7 @@ private:
     bool ensureVrrSourceRetentionSlot();
     bool vrrSourceFrameBusy(const pl_frame& frame) const;
     void retireCompletedVrrSourceFrames();
-    void retainVrrSourceFrame(pl_frame& frame);
+    void retainVrrSourceFrame(pl_frame& frame, AVFrame* owner = nullptr);
     void releaseAllVrrSourceFrames();
 #endif
 
@@ -176,6 +178,15 @@ private:
     pl_renderer m_Renderer = nullptr;
     pl_tex m_Textures[PL_MAX_PLANES] = {};
     pl_color_space m_LastColorspace = {};
+    // pl_swapchain_submit_frame() takes libplacebo's pending graphics command
+    // outside the lock that guards command recording. Work recorded on other
+    // threads (overlay uploads, offscreen preparation, PyroWave surface holds)
+    // must not begin a command inside that window, so it and every swapchain
+    // submit hold this lock. Texture creation records nothing and stays out.
+    std::mutex m_CommandLock;
+#if defined(HAVE_PYROWAVE) && defined(Q_OS_LINUX)
+    std::unique_ptr<PyroWavePlaceboPool> m_PyroWavePool;
+#endif
 
 #ifdef Q_OS_LINUX
     struct PreparedImage;
@@ -194,6 +205,17 @@ private:
     pl_renderer m_PreparationRenderer = nullptr;
     pl_tex m_PreparationTextures[PL_MAX_PLANES] = {};
     std::vector<pl_tex> m_PreparationFreeTextures;
+    // Deferred acquisition: render into a renderer-owned texture at
+    // preparation and acquire, copy and present the swapchain image only at
+    // the target. A held swapchain image keeps its buffer on the GPU's
+    // residency list, so the next decode can delay its flip.
+    bool m_DeferredAcquireEnabled = false;
+    bool m_DeferredTemplateValid = false;
+    pl_swapchain_frame m_DeferredTemplate = {};
+    pl_tex_params m_DeferredTextureParams = {};
+    pl_tex m_DeferredTextures[2] = {};
+    int m_DeferredIndex = 0;
+    pl_tex m_DeferredPreparedTexture = nullptr;
     // The ordinary renderer can still handle an incompatible output epoch.
     // Serialize the shared overlay snapshot while either renderer records it.
     QMutex m_ImageRenderLock;
@@ -219,6 +241,8 @@ private:
     std::atomic<VrrFallbackReason> m_VrrFallbackReason { VrrFallbackReason::InitializationFailed };
     std::atomic<bool> m_VrrWindowChangePending { false };
     bool m_VrrPreparingFrame = false;
+    // renderFrame() targets a deferred-acquisition texture (Linux Mailbox).
+    bool m_VrrRenderIntoDeferred = false;
     bool m_VrrFramePrepared = false;
     bool m_VrrRenderSucceeded = false;
     bool m_VrrRenderTimingActive = false;
@@ -233,9 +257,12 @@ private:
         int64_t pts;
         uint64_t outputUs;
         uint64_t lastBusyUs;
+        // Pool-backed PyroWave frames have no libplacebo AVFrame mapping.
+        AVFrame* poolOwner;
     };
     std::deque<RetainedSource> m_VrrRetainedSourceFrames;
     bool m_VrrCurrentSourceRetained = false;
+    bool m_LoggedPyroWaveRenderFormat = false;
     uint64_t m_VrrRetainedSourceFrameTotal = 0;
     uint64_t m_VrrSourceRetirementWaits = 0;
     uint64_t m_VrrSourceRetirementWaitUs = 0;
@@ -295,9 +322,4 @@ private:
     PFN_vkGetPhysicalDeviceProperties fn_vkGetPhysicalDeviceProperties = nullptr;
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR fn_vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties fn_vkEnumerateDeviceExtensionProperties = nullptr;
-
-#ifdef HAVE_PYROWAVE
-    // PyroWave: planes the decoder writes on this device (null for other codecs)
-    std::unique_ptr<PlVkPyroWaveSurfaces> m_PyroWaveSurfaces;
-#endif
 };

@@ -2,6 +2,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/profilecodec.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrframedroppolicy.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h"
+#include "../../app/streaming/video/ffmpeg-renderers/d3d11presentpolicy.h"
 #include "vrrtestfakes.h"
 
 #include <SDL.h>
@@ -17,6 +18,9 @@
 #include <cstdio>
 #include <functional>
 #include <limits>
+#include <mutex>
+#include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -25,6 +29,7 @@ namespace {
 std::chrono::steady_clock::time_point g_TestClockOrigin =
     std::chrono::steady_clock::now();
 std::atomic_uint64_t g_FrozenTestClockUs { 0 };
+std::atomic_uint64_t g_SteppedTestClockUs { 0 };
 std::atomic_int64_t g_TestClockOffsetUs { 0 };
 int failures = 0;
 
@@ -201,10 +206,12 @@ void testPreparedFramesOverlapAndTrace()
         expect(worker.start(), "prepared-frame worker must start");
         auto a = frame(1, first);
         a.frame()->pkt_dts = a.decoderOutputUs();
+        a.setDeliveryTimeline(1, 1, 0);
         worker.submit(std::move(a));
         expect(backend.waitForPrepareCount(1), "completed stage must activate on the pacing thread");
         auto b = frame(2, second);
         b.frame()->pkt_dts = b.decoderOutputUs();
+        b.setDeliveryTimeline(2, 2, 0);
         worker.submit(std::move(b));
         expect(backend.tickets.size() == 2 && backend.tickets[1]->wait([] { return false; }),
                "next image preparation must advance while the pacing thread owns the previous image");
@@ -222,6 +229,18 @@ void testPreparedFramesOverlapAndTrace()
     }
     expect(backend.stopped && first.releases == 1 && second.releases == 1 && pending.releases == 1,
            "prepared-frame shutdown must stop preparation and release each image exactly once");
+    const auto graph = telemetry.timingGraphSnapshot().points;
+    expect(!graph.empty() && graph.back().extraDelayUs == telemetryStats(telemetry).vrrAppliedSmoothingUs,
+           "frametime and stats must publish the same frame's planned extra phase");
+    expect(graph.size() == 2 && graph[0].targetUs && graph[0].submissionUs &&
+               graph[1].targetUs && graph[1].submissionUs,
+           "normal prepared presentations must publish individual target and submission observations for live stats");
+    expect(graph.size() == 2 && graph[0].networkReadyUs == 1 && graph[1].networkReadyUs == 2 &&
+               graph[0].decoderReadyUs == graph[0].decoderOutputUs &&
+               graph[1].decoderReadyUs == graph[1].decoderOutputUs,
+           "input graph must retain frame-specific network and proven staged decoder readiness");
+    expect(graph.size() == 2 && graph[0].toleranceUs == 500 && graph[1].toleranceUs == 500,
+           "input graph must carry the active Smooth profile tolerance on each frame");
     const auto lines = readExpandedTrace(path).split('\n');
     const auto columns = lines.value(0).split(',');
     int stagedRows = 0;
@@ -407,6 +426,8 @@ void testPresentationRequestSelectedBeforePreparation()
                        presented[0].latchedPresentation == prepared[0].latchedPresentation &&
                        presented[0].collectDiagnostics == prepared[0].collectDiagnostics,
                        "preparation and presentation must receive the same mode after a delay");
+                expect(presented.size() == 1 && presented[0].flipProtectionWindowUs != 0,
+                       "the first adaptive submission must require native protection even without a prior present identity");
                 expect(waitFor([&telemetry] { return telemetryStats(telemetry).vrrPrepareLateFrames != 0; }),
                        "swapchain preparation delays must remain accounted for in timing telemetry");
                 expect(telemetryStats(telemetry).vrrCadenceIntervals == 0 &&
@@ -455,8 +476,8 @@ void testQueueCapacityAndDrops(int latencyMode, size_t capacity)
         expect(backend.waitForPrepareCount(1),
                "first worker frame must enter the preparation gate");
 
-        // The active frame and `capacity` successors (three; Smooth: four)
-        // absorb a short decoder burst. One more successor evicts only the
+        // The active frame and `capacity` successors absorb a short decoder
+        // burst. One more successor evicts only the
         // oldest queued frame.
         for (size_t i = 1; i <= capacity; ++i) {
             worker.submit(frame(static_cast<int>(i) + 1, lifetimes[i]));
@@ -498,6 +519,51 @@ void testQueueCapacityAndDrops(int latencyMode, size_t capacity)
     expect(telemetryStats(telemetry).vrrReadiness.samples == capacity + 2 &&
                telemetryStats(telemetry).vrrReadiness.dropped == 1,
            "completion accounting must count each presented or evicted frame once");
+}
+
+class AdmissionWaitPresenter : public FakeVrrFramePresenter {
+public:
+    std::atomic<bool> entered{false};
+    std::atomic<bool> interrupted{false};
+    std::atomic<bool> stopping{false};
+    std::atomic<bool> watchdogExpired{false};
+    VrrPrepareResult prepareFrame(AVFrame*, uint64_t) override
+    {
+        entered.store(true);
+        watchdogExpired.store(!waitFor([&] { return interrupted.load(); }));
+        return {};
+    }
+    void interruptFrameWait(bool stop) override
+    {
+        if (stop) stopping.store(true);
+        interrupted.store(true);
+    }
+};
+
+void testAdmissionWaitInterruption()
+{
+    for (bool windowChange : {false, true}) {
+        resetFakeClock();
+        AdmissionWaitPresenter backend;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime;
+        {
+            VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+            expect(worker.start(), "admission interruption worker must start");
+            worker.submit(frame(1, lifetime));
+            expect(waitFor([&] { return backend.entered.load(); }), "worker must enter admission wait");
+            if (windowChange) {
+                WINDOW_STATE_CHANGE_INFO info = {};
+                info.stateChangeFlags = WINDOW_STATE_CHANGE_MINIMIZED;
+                worker.notifyWindowChanged(&info);
+                expect(backend.interrupted.load() && !backend.stopping.load(),
+                       "window notification must interrupt admission without stopping the presenter");
+            }
+        }
+        expect(backend.stopping.load() && !backend.watchdogExpired.load(),
+               "shutdown must interrupt native admission before joining the worker");
+        expect(lifetime.releases == 1, "interrupted admission must release its decoded frame exactly once");
+    }
 }
 
 void testLatePreparedFramePresentsImmediately()
@@ -634,6 +700,14 @@ void testExpiredQueueSkipsBlockingDecode()
     const PacedFrame discontinuous(nullptr, 3, 749, true, 51000);
     expect(!VrrFrameDropPolicy::beforeDecodeWait(a, discontinuous, 1000, 71000, 8333, false),
            "backward source timestamps must defer to normal discontinuity handling");
+    const PacedFrame steady(nullptr, 4, 6000, true, 1000);
+    const PacedFrame successor(nullptr, 5, 7500, true, 51000);
+    expect(!VrrFrameDropPolicy::beforeDecodeWait(
+               steady, successor, 1000, 51000, 16667, false, 65000),
+           "a queued frame inside learned Smooth playout must survive the two-period stale gate");
+    expect(VrrFrameDropPolicy::beforeDecodeWait(
+               steady, successor, 1000, 90000, 16667, false, 65000),
+           "work beyond the learned playout window must still skip blocking decode");
 }
 
 void testSinglePeriodQueueDelayPreservesFluidity()
@@ -700,6 +774,13 @@ void testLatencyFixDropBoundaries()
            "real queue or scheduler delay beyond the boundary must still yield to a successor");
     expect(VrrFrameDropPolicy::afterRenderWait(decision, 10000, 66667, false, false, 40000),
            "decode service cannot forgive a later target-relative scheduling stall");
+    decision.playoutDelayUs = 65000;
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 50000, false, false, 65000),
+           "a ready frame inside learned playout must not be marked stale before rendering");
+    expect(!VrrFrameDropPolicy::afterRenderWait(decision, 10000, 60000, false, true, 0, 65000),
+           "render waiting inside learned playout must not discard the frame");
+    expect(VrrFrameDropPolicy::afterRenderWait(decision, 10000, 90000, false, false, 0, 65000),
+           "target-relative stale checks must not count playout delay twice");
     expect(VrrFrameDropPolicy::ageExcludingDecodeWaitUs(10, 20, 40000) == 0 &&
                VrrFrameDropPolicy::ageExcludingDecodeWaitUs(20, 10, 40000) == 0,
            "service-age subtraction must not wrap on a reversed or coarsely sampled clock");
@@ -713,11 +794,26 @@ void testLatencyFixDropBoundaries()
            "active latency fix may shed material floor debt below exact refresh");
     expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 0, false, false),
            "ordinary below-refresh playback must keep its natural debt recovery");
+    for (bool latencyFix : {false, true}) {
+        expect(!VrrFrameDropPolicy::beforeRender(decision, 8333, 18000,
+                   false, latencyFix, 4500, true),
+               "late rescue must retain a display-floor-delayed frame within the queue-age bound");
+        expect(VrrFrameDropPolicy::beforeRender(decision, 8333, 18001,
+                   false, latencyFix, 4500, true),
+               "late rescue must still shed actual backlog beyond two source periods");
+    }
+    expect(!VrrFrameDropPolicy::beforeRender(decision, 10000, 9000,
+               false, true, 4500, true),
+           "near-refresh rescue must not mistake display spacing alone for stale work");
 
     decision.sourcePeriodUs = std::numeric_limits<uint64_t>::max();
     expect(VrrFrameDropPolicy::maximumAgeUs(decision, false, false) ==
                std::numeric_limits<uint64_t>::max(),
            "age tolerance multiplication must saturate instead of wrapping");
+    expect(VrrFrameDropPolicy::staleHorizonUs(8333, 2,
+               std::numeric_limits<uint64_t>::max() - 100) ==
+               std::numeric_limits<uint64_t>::max(),
+           "learned-delay addition must saturate instead of wrapping");
 }
 
 void runLatencyFixQueuedRecovery(int streamRateHz, bool enabled,
@@ -1052,6 +1148,324 @@ void testFirstFrameDecodeReadinessTrace()
     qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
 }
 
+void testShortAndAlreadyCompleteDecodeReadiness()
+{
+    // Reproduce the HEVC capture: output was returned almost six milliseconds
+    // before the worker's short (or already-complete) GPU fence observation.
+    class ReadinessPresenter : public FakeVrrFramePresenter {
+    public:
+        uint64_t waitUs = 0;
+        bool observed = true;
+        VrrDecodeReadiness observeDecodeReadiness(AVFrame*, uint64_t) override
+        {
+            g_FrozenTestClockUs.fetch_add(waitUs);
+            return {waitUs, observed, true};
+        }
+    };
+    for (const auto waitUs : {uint64_t(0), uint64_t(83), uint64_t(200), uint64_t(201)}) {
+        for (const bool observed : {false, true}) {
+            if (!observed && waitUs != 0) continue;
+            resetFakeClock();
+            QTemporaryDir directory;
+            const QString path = directory.filePath("short-decode.vrrtrace");
+            qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path).constData());
+            ReadinessPresenter backend;
+            backend.waitUs = waitUs;
+            backend.observed = observed;
+            PacerTelemetry telemetry;
+            TrackedFrameLifetime lifetime;
+            uint64_t outputUs = 0;
+            {
+                VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+                expect(worker.start(), "short decode readiness worker must start");
+                FrozenTestClock clock;
+                auto input = frame(1, lifetime);
+                outputUs = input.decoderOutputUs();
+                clock.advance(5803);
+                worker.submit(std::move(input));
+                expect(backend.waitForPrepareCount(1), "readiness observation must reach preparation");
+                clock.resume();
+                expect(backend.waitForPresentCount(1), "short decode readiness frame must present");
+            }
+            const auto lines = readExpandedTrace(path).split('\n');
+            const auto columns = lines.value(0).split(',');
+            const auto fields = lines.value(1).split(',');
+            const auto value = [&](const char* name) {
+                return fields.value(columns.indexOf(name)).toULongLong();
+            };
+            expect(value("decoder_output_us") == outputUs &&
+                       value("decode_sync_wait_us") == waitUs &&
+                       value("decode_readiness_observed") == uint64_t(observed),
+                   "readiness evidence must preserve immutable output and actual CPU wait");
+            const auto graph = telemetry.timingGraphSnapshot().points;
+            if (observed) {
+                expect(value("decode_complete_us") >= value("dequeue_us") + waitUs &&
+                           value("decode_complete_us") >= outputUs + 5803 &&
+                           value("source_time_us") == value("decode_complete_us"),
+                       "short and zero-wait GPU observations must seed completion-based mapping after the queue");
+                expect(graph.size() == 1 && graph[0].decoderReadyUs == value("decode_complete_us"),
+                       "the graph must use the same proven completion bound as scheduling");
+            }
+            else {
+                expect(graph.size() == 1 && graph[0].decoderReadyUs == 0,
+                       "an unavailable asynchronous completion must remain unknown in the graph");
+            }
+            const char* exportPrefix = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_SHORT_DECODE_TRACE");
+            if (exportPrefix && exportPrefix[0]) {
+                const QString destination = QString::fromLocal8Bit(exportPrefix) +
+                    QString("-%1-%2.vrrtrace").arg(waitUs).arg(observed ? "observed" : "unknown");
+                QFile::remove(destination);
+                expect(QFile::copy(path, destination), "short-readiness fixture must export for exact replay");
+            }
+            qputenv("MOONLIGHT_VRR_TRACE", "");
+        }
+    }
+}
+
+class NativeScheduledPresenter : public FakeVrrFramePresenter {
+public:
+    struct Enqueue {
+        uint64_t targetUs = 0;
+        uint64_t atUs = 0;
+        bool accepted = false;
+    };
+
+    int lateAttempt = 0;
+    uint64_t lateExtraUs = 500;
+    int failedAttempt = 0;
+    std::atomic_uint clears { 0 };
+    std::atomic_uint queuedNativeFrames { 0 };
+
+    NativeScheduledPresenter() { setCanLatch(true); }
+    bool alwaysSynchronizesAdaptivePresent() const override { return true; }
+    bool supportsScheduledPresentation() const override { return true; }
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        const int attempt = ++m_Attempts;
+        if (attempt == lateAttempt) {
+            // Model native work before acceptance, with an actual enqueue
+            // boundary later than the deadline requested by the worker.
+            g_FrozenTestClockUs.store(std::max(LiGetMicroseconds(), request.displayTargetUs + lateExtraUs));
+        }
+        auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Composition;
+        feedback.nativeTargetValid = request.displayTargetUs != 0;
+        feedback.nativeTargetUs = request.displayTargetUs;
+        if (attempt == failedAttempt) {
+            feedback.presented = false;
+            feedback.cancelled = true;
+            feedback.nativeTargetValid = false;
+            feedback.nativeTargetUs = 0;
+            feedback.submissionIdValid = false;
+            feedback.submissionId = 0;
+            feedback.nativePresentResult = -1;
+            feedback.submissionTimeValid = false;
+            feedback.submissionTimeUs = 0;
+        }
+        else {
+            feedback.submissionIdValid = true;
+            feedback.submissionId = ++m_AcceptedId;
+            ++queuedNativeFrames;
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_EnqueueMutex);
+            m_Enqueues.push_back({request.displayTargetUs, LiGetMicroseconds(), feedback.presented});
+        }
+        return feedback;
+    }
+
+    void clearScheduledPresentation() override
+    {
+        queuedNativeFrames.store(0);
+        ++clears;
+    }
+
+    std::vector<Enqueue> enqueues() const
+    {
+        std::lock_guard<std::mutex> lock(m_EnqueueMutex);
+        return m_Enqueues;
+    }
+
+private:
+    std::atomic_int m_Attempts { 0 };
+    uint64_t m_AcceptedId = 0;
+    mutable std::mutex m_EnqueueMutex;
+    std::vector<Enqueue> m_Enqueues;
+};
+
+void testNativeScheduledEnqueueCadenceAndLifecycle()
+{
+    for (const char* variant : {"accepted", "late", "failed"}) {
+        resetFakeClock();
+        QTemporaryDir directory;
+        const QString path = directory.filePath("native-scheduled.vrrtrace");
+        qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(path).constData());
+        qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+        NativeScheduledPresenter backend;
+        backend.lateAttempt = std::string(variant) == "late" ? 2 : 0;
+        backend.failedAttempt = std::string(variant) == "failed" ? 2 : 0;
+        PacerTelemetry telemetry;
+        std::array<TrackedFrameLifetime, 7> lifetimes;
+        auto session = enabledConfig();
+        session.streamRateHz = 120;
+        session.latencyMode = 2;
+        unsigned clearCountBeforeShutdown = 0;
+        unsigned completed = 0;
+        {
+            // Explicit stepping proves ordering without depending on the
+            // scheduler delivering the test thread within a fraction of a ms.
+            FrozenTestClock clock;
+            g_FrozenTestClockUs.store(1000000);
+            VrrPacingWorker worker(&backend, session, &telemetry);
+            expect(worker.start(), "native scheduled worker fixture must start");
+            const auto submit = [&](int index) {
+                worker.submit(makeTrackedPacedFrame(index + 1, uint32_t(index * 750),
+                                                    LiGetMicroseconds(), lifetimes[index]));
+            };
+            submit(0);
+            bool successorAlreadyQueued = false;
+            uint64_t priorLogicalUs = 0;
+            for (int i = 0; i < 6; ++i) {
+                if (i != 0 && !successorAlreadyQueued) submit(i);
+                successorAlreadyQueued = false;
+                const bool enqueued = waitFor([&] { return backend.enqueues().size() > size_t(i); });
+                expect(enqueued, "prepared native frame must enqueue before its worker cadence hold");
+                if (!enqueued) {
+                    // Resume time before destroying a worker whose old wait
+                    // implementation may still own an outstanding deadline.
+                    clock.resume();
+                    break;
+                }
+                const auto event = backend.enqueues()[i];
+                expect(event.targetUs != 0,
+                       "native presentation must receive the controller's display deadline");
+                if (priorLogicalUs) {
+                    expect(event.targetUs >= priorLogicalUs + 8333,
+                           "successive accepted native deadlines must clear one display period");
+                }
+                if (i != 1 || backend.lateAttempt == 0) {
+                    expect(event.atUs < event.targetUs,
+                           "ready native frames must enqueue before the display deadline");
+                }
+                else {
+                    expect(event.atUs == event.targetUs + 500,
+                           "late native fixture must preserve the actual enqueue boundary");
+                }
+                if (i == 0) {
+                    // Deliver a replacement while the first image is native
+                    // owned. It must remain queued, not be prepared early.
+                    submit(1);
+                    successorAlreadyQueued = true;
+                    expect(telemetryStats(telemetry).vrrPresentedFrames == 0 &&
+                               backend.preparedFrames().size() == 1,
+                           "native acceptance must precede worker completion and the next dequeue");
+                    g_FrozenTestClockUs.store(event.targetUs - 1);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    expect(telemetryStats(telemetry).vrrPresentedFrames == 0 &&
+                               backend.preparedFrames().size() == 1,
+                           "worker completion and the next preparation must wait until the native deadline");
+                }
+                g_FrozenTestClockUs.store(std::max(LiGetMicroseconds(), event.targetUs + 75));
+                ++completed;
+                const unsigned expectedPresents = completed - (backend.failedAttempt != 0 && completed >= 2 ? 1 : 0);
+                const unsigned expectedDrops = backend.failedAttempt != 0 && completed >= 2 ? 1 : 0;
+                expect(waitFor([&] {
+                    const auto stats = telemetryStats(telemetry);
+                    return stats.vrrPresentedFrames >= expectedPresents &&
+                        stats.vrrPacingDroppedFrames >= expectedDrops;
+                }), "native outcome must complete after the logical deadline");
+                if (event.accepted) priorLogicalUs = std::max(event.atUs, event.targetUs);
+            }
+            if (std::string(variant) == "accepted") {
+                const unsigned priorClears = backend.clears.load();
+                WINDOW_STATE_CHANGE_INFO changed {};
+                changed.stateChangeFlags = WINDOW_STATE_CHANGE_DISPLAY;
+                worker.notifyWindowChanged(&changed);
+                expect(waitFor([&] { return backend.clears.load() > priorClears; }),
+                       "display epoch change must clear native queued deadlines on the worker");
+                expect(backend.queuedNativeFrames == 0,
+                       "no native queue entry from the old display epoch may remain");
+                submit(6);
+                expect(waitFor([&] { return backend.enqueues().size() == 7; }),
+                       "fresh presentation must resume after clearing the native display epoch");
+                if (backend.enqueues().size() == 7) {
+                    const auto fresh = backend.enqueues().back();
+                    g_FrozenTestClockUs.store(std::max(LiGetMicroseconds(), fresh.targetUs + 75));
+                    expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 7; }),
+                           "fresh native frame must complete under the new display epoch");
+                    ++completed;
+                }
+            }
+            clearCountBeforeShutdown = backend.clears.load();
+            clock.resume();
+        }
+        expect(completed >= 6 && backend.clears.load() > clearCountBeforeShutdown &&
+                   backend.queuedNativeFrames == 0,
+               "shutdown must clear accepted native work without a replacement submission");
+        for (unsigned i = 0; i < completed; ++i) {
+            expect(lifetimes[i].releases == 1,
+                   "native scheduled source ownership must release each frame exactly once");
+        }
+        const auto expanded = readExpandedTrace(path);
+        const auto lines = expanded.split('\n');
+        const auto columns = lines.value(0).split(',');
+        unsigned rows = 0;
+        uint64_t acceptedLogicalUs = 0;
+        bool observedLate = false;
+        bool observedFailure = false;
+        bool observedEpoch = false;
+        for (int i = 1; i < lines.size(); ++i) {
+            const auto fields = lines[i].split(',');
+            if (fields.size() != columns.size()) continue;
+            const auto value = [&](const char* name) {
+                return fields.value(columns.indexOf(name)).toULongLong();
+            };
+            ++rows;
+            expect(value("native_scheduled_presentation") == 1 &&
+                       value("param_native_scheduled_presentation") == 1 &&
+                       value("native_target_us") == (value("presented") ? value("target_us") : 0) &&
+                       value("native_backend_valid") == 1 && value("native_backend") == 3,
+                   "scheduled trace must preserve the capability and native display deadline");
+            expect(value("target_wait_entry_us") >= value("present_end_us") &&
+                       value("target_wait_final_us") >= value("target_us"),
+                   "native trace must place the worker cadence hold after enqueue and through the deadline");
+            if (value("presented")) {
+                const uint64_t logical = std::max(value("submission_boundary_us"), value("native_target_us"));
+                expect(value("scheduling_boundary_us") == logical &&
+                           (!acceptedLogicalUs || value("target_us") >= acceptedLogicalUs + 8333),
+                       "scheduling feedback must use accepted deadlines while tracing actual native enqueue");
+                observedLate |= value("submission_boundary_us") > value("native_target_us");
+                acceptedLogicalUs = logical;
+                observedEpoch |= value("external_rebase_applied") != 0 && value("frame") == 7;
+            }
+            else {
+                observedFailure = true;
+                expect(value("cancelled") == 1 &&
+                           value("scheduling_boundary_us") == value("submission_boundary_us"),
+                       "failed native enqueue must not claim the unaccepted future deadline as its boundary");
+            }
+        }
+        expect(rows == completed && expanded.contains("#vrr_trace_footer,"),
+               "scheduled fixture must close with one terminal row per delivery and a clean footer");
+        expect((backend.lateAttempt != 0) == observedLate &&
+                   (backend.failedAttempt != 0) == observedFailure &&
+                   (std::string(variant) == "accepted") == observedEpoch,
+               "scheduled fixtures must retain their late, failure, and epoch evidence");
+        const char* exportPrefix = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_NATIVE_SCHEDULED_TRACE");
+        if (exportPrefix && exportPrefix[0]) {
+            const QString destination = QString::fromLocal8Bit(exportPrefix) +
+                QString("-%1.vrrtrace").arg(QString::fromLatin1(variant));
+            QFile::remove(destination);
+            expect(QFile::copy(path, destination),
+                   "native scheduled fixture must export separately for exact replay");
+        }
+        qputenv("MOONLIGHT_VRR_TRACE", "");
+        qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+    }
+}
+
 void testTelemetrySnapshotsRemainCumulative()
 {
     PacedFrame readinessProbe(nullptr, 1, 0, false, 100);
@@ -1060,8 +1474,12 @@ void testTelemetrySnapshotsRemainCumulative()
                readinessProbe.decodeCompleteUs() == 250,
            "GPU readiness must not rewrite the decoder-output timestamp");
 
+    // Four independent histories exceed the Windows default test stack.
+    // Production owns one telemetry object inside the heap-allocated pacer.
+    // Keep this multi-history fixture on the heap without changing assertions.
     // Motion must reveal host-timed judder even when source fidelity is perfect.
-    PacerTelemetry motion;
+    auto motionStorage = std::make_unique<PacerTelemetry>();
+    auto& motion = *motionStorage;
     VrrTelemetrySample motionSample;
     motionSample.presented = true;
     motionSample.submissionUs = 1000000;
@@ -1090,9 +1508,11 @@ void testTelemetrySnapshotsRemainCumulative()
     expect(motion.snapshot().vrrMotionHitches == 6,
            "a local drop must not hide the resulting motion hitch");
 
-    PacerTelemetry legacyTelemetry;
+    auto legacyTelemetryStorage = std::make_unique<PacerTelemetry>();
+    auto& legacyTelemetry = *legacyTelemetryStorage;
     // Decode synchronization must not inflate the visible queue statistic.
-    PacerTelemetry decodeTelemetry;
+    auto decodeTelemetryStorage = std::make_unique<PacerTelemetry>();
+    auto& decodeTelemetry = *decodeTelemetryStorage;
     VrrTelemetrySample decodeSample;
     decodeSample.presented = true;
     decodeSample.clientProcessingTimeUs = 10000;
@@ -1114,7 +1534,8 @@ void testTelemetrySnapshotsRemainCumulative()
                legacySnapshot.totalRenderingTimeUs == 40,
            "legacy timing must use the same exact client-processing partition");
 
-    PacerTelemetry telemetry;
+    auto telemetryStorage = std::make_unique<PacerTelemetry>();
+    auto& telemetry = *telemetryStorage;
     telemetry.beginVrrSession();
 
     constexpr uint64_t frameCount = 512;
@@ -1650,8 +2071,8 @@ void testTraceCapturesEveryDeliveredFrame()
     FakeVrrFramePresenter backend;
     backend.blockPreparation();
     PacerTelemetry telemetry;
-    TrackedFrameLifetime lifetimes[10];
-    // The burst below overflows a three-frame queue; Smooth holds four.
+    TrackedFrameLifetime lifetimes[11];
+    // The burst below (frames 2-5 and 11) overflows the four-frame queue.
     VrrSessionConfig traceConfig = enabledConfig();
     traceConfig.latencyMode = 1;
     {
@@ -1663,8 +2084,9 @@ void testTraceCapturesEveryDeliveredFrame()
         for (int frameNumber = 2; frameNumber <= 5; ++frameNumber) {
             worker.submit(frame(frameNumber, lifetimes[frameNumber - 1]));
         }
+        worker.submit(frame(11, lifetimes[10]));
         backend.releasePreparation();
-        expect(backend.waitForPresentCount(4),
+        expect(backend.waitForPresentCount(5),
                "replay trace test must drain retained frames");
 
         WINDOW_STATE_CHANGE_INFO minimized {};
@@ -1680,7 +2102,7 @@ void testTraceCapturesEveryDeliveredFrame()
         restored.stateChangeFlags = WINDOW_STATE_CHANGE_RESTORED;
         worker.notifyWindowChanged(&restored);
         worker.submit(frame(7, lifetimes[6]));
-        expect(backend.waitForPresentCount(5),
+        expect(backend.waitForPresentCount(6),
                "restored trace frame must present after an explicit rebase");
 
         WINDOW_STATE_CHANGE_INFO resized {};
@@ -1689,12 +2111,12 @@ void testTraceCapturesEveryDeliveredFrame()
         resized.height = 1080;
         worker.notifyWindowChanged(&resized);
         worker.submit(frame(8, lifetimes[7]));
-        expect(backend.waitForPresentCount(6),
+        expect(backend.waitForPresentCount(7),
                "first frame after a geometry refresh must use a new trace epoch");
 
         backend.blockPreparation();
         worker.submit(frame(9, lifetimes[8]));
-        expect(backend.waitForPrepareCount(7),
+        expect(backend.waitForPrepareCount(8),
                "display-epoch race test must hold an in-flight frame");
         WINDOW_STATE_CHANGE_INFO displayChanged {};
         displayChanged.stateChangeFlags = WINDOW_STATE_CHANGE_DISPLAY;
@@ -1703,11 +2125,11 @@ void testTraceCapturesEveryDeliveredFrame()
         backend.releasePreparation();
         expect(backend.waitForCancelCount(1),
                "an in-flight frame must be cancelled after display state changes");
-        expect(backend.presentCount() == 6,
+        expect(backend.presentCount() == 7,
                "a decision from the prior display epoch must not be presented");
 
         worker.submit(frame(10, lifetimes[9]));
-        expect(backend.waitForPresentCount(7),
+        expect(backend.waitForPresentCount(8),
                "the post-interrupt frame must start the refreshed display epoch");
     }
 
@@ -1901,7 +2323,7 @@ void testTraceCapturesEveryDeliveredFrame()
                    [](int column) { return column >= 0; }),
            "replay schema must expose raw arrivals and terminal disposition");
 
-    bool observedFrames[11] = {};
+    bool observedFrames[12] = {};
     bool observedCapacityDrop = false;
     bool observedRejectedArrival = false;
     bool observedRestoreRebase = false;
@@ -1925,8 +2347,8 @@ void testTraceCapturesEveryDeliveredFrame()
             observedCleanFooter =
                 lines[i].contains("format_version=2") &&
                 lines[i].contains("clean_shutdown=1") &&
-                lines[i].contains("arrival_sequence_allocated=10") &&
-                lines[i].contains("rows_enqueued=10") &&
+                lines[i].contains("arrival_sequence_allocated=11") &&
+                lines[i].contains("rows_enqueued=11") &&
                 lines[i].contains("rows_dropped=0") &&
                 lines[i].contains("size_capped=0") &&
                 lines[i].contains("write_failed=0") &&
@@ -1947,7 +2369,7 @@ void testTraceCapturesEveryDeliveredFrame()
         }
         ++rowCount;
         const int frameNumber = fields[frameColumn].toInt();
-        if (frameNumber >= 1 && frameNumber <= 10) {
+        if (frameNumber >= 1 && frameNumber <= 11) {
             observedFrames[frameNumber] = true;
         }
         expect(fields[rtpColumn].toULongLong() ==
@@ -2021,12 +2443,12 @@ void testTraceCapturesEveryDeliveredFrame()
                 fields[midframeWindowStateFlagsColumn] == "0";
         }
     }
-    expect(rowCount == 10,
+    expect(rowCount == 11,
            "trace must contain exactly one terminal row per delivered frame");
     expect(observedFrames[1] && observedFrames[2] && observedFrames[3] &&
                observedFrames[4] && observedFrames[5] && observedFrames[6] &&
                observedFrames[7] && observedFrames[8] &&
-               observedFrames[9] && observedFrames[10],
+               observedFrames[9] && observedFrames[10] && observedFrames[11],
            "trace must not omit evicted or presented deliveries");
     expect(observedCapacityDrop,
            "trace must identify the frame evicted by queue capacity");
@@ -2214,6 +2636,754 @@ void testFailedCancellationNativeEvidenceIsTraced()
     qputenv("MOONLIGHT_VRR_TRACE", "");
 }
 
+// Model Metal's asynchronous drawable callback: a later submission reports
+// the display event for its predecessor, using a local serial ID and an
+// already-converted Moonlight timestamp. No DXGI query fields are available.
+class MetalFeedbackPresenter : public FakeVrrFramePresenter {
+public:
+    uint64_t uncertaintyUs = 250;
+    bool failPreparation = false;
+
+    VrrPrepareResult prepareFrame(AVFrame* frame, uint64_t boundary) override
+    {
+        auto result = FakeVrrFramePresenter::prepareFrame(frame, boundary);
+        // Metal waits for its render command buffer before the deadline hold.
+        // Preserve the CPU completion bracket without D3D11 fence/event data.
+        const uint64_t startUs = LiGetMicroseconds();
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        const uint64_t readyUs = LiGetMicroseconds();
+        result.feedback.gpuReadyAttempted = true;
+        result.feedback.gpuReadyWaitStartUs = startUs;
+        result.feedback.gpuReadyTimeUs = readyUs;
+        result.feedback.gpuReadyPollStartUs = startUs;
+        result.feedback.gpuReadyPollEndUs = readyUs;
+        result.feedback.gpuReadyWaitResultValid = true;
+        result.feedback.gpuReadyWaitResult = failPreparation ? 2 : 0;
+        result.feedback.gpuReadyTimingValid = !failPreparation;
+        result.prepared &= !failPreparation;
+        result.sourceFrameReusable = true;
+        m_GpuFeedback = result.feedback;
+        return result;
+    }
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        auto feedback = withReadiness(FakeVrrFramePresenter::presentAdaptive(request));
+        feedback.nativeBackend = VrrNativePresentationBackend::Metal;
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = feedback.submissionTimeUs;
+        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = ++m_Serial;
+        if (m_PreviousSubmissionUs != 0) {
+            feedback.latchSampleValid = true;
+            feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+            feedback.latchSubmissionId = m_Serial - 1;
+            feedback.latchTimeUs = m_PreviousSubmissionUs + 1000;
+            feedback.presentationUncertaintyUs = uncertaintyUs;
+        }
+        m_PreviousSubmissionUs = feedback.submissionTimeUs;
+        return feedback;
+    }
+
+    VrrPresentFeedback cancelFrame() override
+    {
+        return withReadiness(FakeVrrFramePresenter::cancelFrame());
+    }
+
+private:
+    VrrPresentFeedback withReadiness(VrrPresentFeedback feedback)
+    {
+        feedback.gpuReadyAttempted = m_GpuFeedback.gpuReadyAttempted;
+        feedback.gpuReadyWaitStartUs = m_GpuFeedback.gpuReadyWaitStartUs;
+        feedback.gpuReadyTimeUs = m_GpuFeedback.gpuReadyTimeUs;
+        feedback.gpuReadyPollStartUs = m_GpuFeedback.gpuReadyPollStartUs;
+        feedback.gpuReadyPollEndUs = m_GpuFeedback.gpuReadyPollEndUs;
+        feedback.gpuReadyWaitResultValid = m_GpuFeedback.gpuReadyWaitResultValid;
+        feedback.gpuReadyWaitResult = m_GpuFeedback.gpuReadyWaitResult;
+        feedback.gpuReadyTimingValid = m_GpuFeedback.gpuReadyTimingValid;
+        m_GpuFeedback = {};
+        return feedback;
+    }
+
+    uint64_t m_Serial = 0;
+    uint64_t m_PreviousSubmissionUs = 0;
+    VrrPresentFeedback m_GpuFeedback;
+};
+
+class SynchronizedCompositionPresenter : public FakeVrrFramePresenter {
+public:
+    bool alwaysSynchronizesAdaptivePresent() const override { return true; }
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
+        feedback.nativeBackend = VrrNativePresentationBackend::Composition;
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = feedback.submissionTimeUs;
+        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = ++m_Id;
+        if (m_PreviousSubmissionUs) {
+            feedback.latchSampleValid = true;
+            feedback.latchTimeKind = Vrr13::PresentationTimeKind::DisplayEvent;
+            feedback.latchSubmissionId = m_Id - 1;
+            feedback.latchTimeUs = m_PreviousSubmissionUs + 500;
+            feedback.presentationUncertaintyUs = 1;
+        }
+        m_PreviousSubmissionUs = feedback.submissionTimeUs;
+        return feedback;
+    }
+
+private:
+    uint64_t m_Id = 0, m_PreviousSubmissionUs = 0;
+};
+
+// DXGI reports the preceding image's refresh identity and a separately sampled
+// refresh clock. Keep this evidence distinct from a native display event.
+class DelayedDxgiRefreshPresenter : public FakeVrrFramePresenter {
+public:
+    DelayedDxgiRefreshPresenter(bool virtualizationDisabled, uint64_t disjointId) :
+        m_VirtualizationDisabled(virtualizationDisabled), m_DisjointId(disjointId)
+    {}
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
+        feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = ++m_Id;
+        feedback.nativeVblankVirtualizationDisabled = m_VirtualizationDisabled;
+        feedback.frameStatsDisjoint = m_Id == m_DisjointId;
+        if (m_PreviousSubmissionUs) {
+            feedback.latchSampleValid = !feedback.frameStatsDisjoint;
+            feedback.latchTimeKind = Vrr13::PresentationTimeKind::RefreshReference;
+            feedback.latchSubmissionId = m_Id - 1;
+            feedback.latchPresentRefreshSequence = m_Id - 1;
+            feedback.latchRefreshSequence = m_Id - 1;
+            feedback.latchTimeUs = m_PreviousSubmissionUs + 1000;
+            feedback.latchRawSyncQpcValid = true;
+            feedback.latchRawSyncQpcTicks = feedback.latchTimeUs;
+            feedback.latchRawSyncQpcFrequency = 1000000;
+            feedback.latchQpcCorrelationValid = true;
+            feedback.latchQpcCorrelationReferenceTicks = feedback.latchTimeUs;
+            feedback.latchQpcCorrelationReferenceTimeUs = feedback.latchTimeUs;
+            feedback.latchQpcCorrelationSpanTicks = 100;
+        }
+        m_PreviousSubmissionUs = feedback.submissionTimeUs;
+        return feedback;
+    }
+
+private:
+    const bool m_VirtualizationDisabled;
+    const uint64_t m_DisjointId;
+    uint64_t m_Id = 0, m_PreviousSubmissionUs = 0;
+};
+
+class GuardOnlyDxgiPresenter : public FakeVrrFramePresenter {
+public:
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        // Hold the simulated native operation's clock still so scheduler
+        // preemption cannot turn the fresh-blank fixture into a stale one.
+        FrozenTestClock clock;
+        VrrPresentFeedback feedback;
+        feedback.nativeBackendValid = true;
+        feedback.nativeBackend = VrrNativePresentationBackend::Dxgi;
+        feedback.nativeVrrStateValid = true;
+        feedback.nativeTearingSupported = true;
+        feedback.nativeBorderlessFlipModel = true;
+        feedback.nativeSameGpuOutput = true;
+        feedback.nativeRenderAdapterLuidValid = true;
+        feedback.nativeRenderAdapterLuid = 0x1234;
+        feedback.nativeSwapChainAllowsTearing = true;
+        feedback.nativeTearingFeatureQueryResultValid = true;
+        feedback.nativeTearingFeatureAllowsTearing = true;
+        feedback.nativeSwapChainDescQueryResultValid = true;
+        feedback.nativeSwapChainFlags = 0x840; // Tearing and frame-latency handle.
+        feedback.nativeSwapChainSwapEffect = 4; // FLIP_DISCARD.
+        feedback.nativeFullscreenStateQueryResultValid = true;
+        feedback.nativeWindowFlags = 0x1001; // SDL_WINDOW_FULLSCREEN_DESKTOP.
+        feedback.nativePresentReadyAvailable = true;
+        feedback.nativeForegroundWindow = true;
+        feedback.nativeDesktopMonitorCount = 1;
+        feedback.nativeVblankVirtualizationProbeComplete = true;
+        feedback.nativeVblankVirtualizationCallAvailable = true;
+        feedback.nativeVblankVirtualizationResultValid = true;
+        feedback.nativeVblankVirtualizationDisabled = true;
+        feedback.nativeDisplayConfigQueryResultValid = true;
+        feedback.nativeDisplayPathValid = true;
+        feedback.nativeDisplayPathFlags = 1;
+        feedback.nativeDisplayTargetAvailable = true;
+        feedback.nativeDisplaySourceAdapterLuid = 0x1234;
+        feedback.nativeDisplaySourceId = 1;
+        feedback.nativeDisplayTargetAdapterLuid = 0x1234;
+        feedback.nativeDisplayTargetId = 1;
+        feedback.nativeDisplayRotation = 1;
+        feedback.nativeDisplayScaling = 1;
+        feedback.nativeDisplayPathRefreshNumerator = 120;
+        feedback.nativeDisplayPathRefreshDenominator = 1;
+        feedback.nativeDisplaySignalValid = true;
+        feedback.nativeDisplaySignalPixelRateHz = 297000000;
+        feedback.nativeDisplaySignalHSyncNumerator = 135000;
+        feedback.nativeDisplaySignalHSyncDenominator = 1;
+        feedback.nativeDisplaySignalVSyncNumerator = 120;
+        feedback.nativeDisplaySignalVSyncDenominator = 1;
+        feedback.nativeDisplaySignalActiveWidth = 1920;
+        feedback.nativeDisplaySignalActiveHeight = 1080;
+        feedback.nativeDisplaySignalTotalWidth = 2200;
+        feedback.nativeDisplaySignalTotalHeight = 1125;
+        feedback.nativeDisplaySignalScanLineOrdering = 1;
+        feedback.nativeRasterOpenResultValid = true;
+        feedback.nativeRasterSourceValid = true;
+        feedback.nativeRasterVidPnSourceId = 1;
+        const bool latched = D3D11PresentPolicy::latch(
+            request.latchedPresentation, false, request.flipProtectionWindowUs,
+            [&] {
+                D3D11PresentPolicy::FlipObservation observation;
+                feedback.flipProtectionChecked = true;
+                feedback.flipProtectionQueryStartUs = LiGetMicroseconds();
+                observation.predecessorKnown = m_Id != 0;
+                observation.statisticsValid = observation.predecessorKnown;
+                if (observation.statisticsValid) {
+                    auto& raster = feedback.nativeRasterBeforePresent;
+                    raster.queryResultValid = true;
+                    raster.queryStartUs = LiGetMicroseconds();
+                    raster.queryResult = m_Id == 3 ? -1 : 0;
+                    raster.inVerticalBlank = m_Id == 1;
+                    raster.scanLine = m_Id == 2 ? 500 : 0;
+                    raster.queryEndUs = LiGetMicroseconds();
+                    observation.rasterValid = raster.queryResult == 0;
+                    observation.inVerticalBlank = raster.inVerticalBlank;
+                    observation.rasterQueryStartUs = raster.queryStartUs;
+                    observation.rasterQueryEndUs = raster.queryEndUs;
+                }
+                feedback.flipProtectionQueryEndUs = LiGetMicroseconds();
+                return observation;
+            }, [] { return LiGetMicroseconds(); });
+        feedback.flipProtectionLatched = !request.latchedPresentation && latched;
+        feedback.nativePresentParametersValid = true;
+        feedback.nativePresentSyncInterval = latched ? 1 : 0;
+        feedback.nativePresentFlags = latched ? 0 : 0x200;
+        const auto submitted = FakeVrrFramePresenter::presentAdaptive(request);
+        feedback.presented = submitted.presented;
+        feedback.cancelled = submitted.cancelled;
+        feedback.submissionTimeValid = submitted.submissionTimeValid;
+        feedback.submissionTimeUs = submitted.submissionTimeUs;
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentTimingValid = request.collectDiagnostics ||
+            feedback.nativeRasterBeforePresent.queryResultValid;
+        if (feedback.nativePresentTimingValid) {
+            feedback.nativePresentStartUs = submitted.submissionTimeUs;
+            feedback.nativePresentEndUs = LiGetMicroseconds();
+        }
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = ++m_Id;
+        feedback.submissionIdQueryResultValid = true;
+        // No post-Present display observation is supplied by this fixture.
+        feedback.frameStatsQueryResultValid = true;
+        feedback.frameStatsQueryResult = -2147467259LL;
+        return feedback;
+    }
+private:
+    uint64_t m_Id = 0;
+};
+
+// Model both D3D11 fence placements using the same trace contract. Advancing
+// the test clock makes a long render deterministic without relying on an OS
+// sleep to cross the target. The prepared image owns its rendered output;
+// successful early completion therefore permits release of the decoder input.
+class D3D11ReadinessPresenter : public FakeVrrFramePresenter {
+public:
+    D3D11ReadinessPresenter(FrozenTestClock& clock,
+                           TrackedFrameLifetime& lifetime,
+                           bool completeDuringPreparation,
+                           uint64_t gpuWorkUs) :
+        m_Clock(clock), m_Lifetime(lifetime),
+        m_CompleteDuringPreparation(completeDuringPreparation),
+        m_GpuWorkUs(gpuWorkUs)
+    {}
+
+    VrrPrepareResult prepareFrame(AVFrame* frame, uint64_t boundary) override
+    {
+        auto result = FakeVrrFramePresenter::prepareFrame(frame, boundary);
+        const uint64_t markerUs = LiGetMicroseconds();
+        m_Readiness = {};
+        m_Readiness.gpuReadyAttempted = true;
+        m_Readiness.gpuReadySignalResultValid = true;
+        m_Readiness.gpuReadySetEventResultValid = true;
+        m_Readiness.gpuReadySignalStartUs = markerUs;
+        m_Readiness.gpuReadySignalEndUs = markerUs;
+        m_Readiness.gpuReadyFlushStartUs = markerUs;
+        m_Readiness.gpuReadyFlushEndUs = markerUs;
+        m_Readiness.gpuReadySetEventStartUs = markerUs;
+        m_Readiness.gpuReadySetEventEndUs = markerUs;
+        m_Readiness.gpuReadyPollStartUs = markerUs;
+        m_Readiness.gpuReadyPollEndUs = markerUs;
+        m_Readiness.gpuReadyFenceValue = 1;
+        if (m_CompleteDuringPreparation) completeFence();
+        result.feedback = m_Readiness;
+        result.sourceFrameReusable = m_CompleteDuringPreparation;
+        m_Clock.resume();
+        return result;
+    }
+
+    VrrPresentFeedback presentAdaptive(const VrrPresentRequest& request) override
+    {
+        sourceReleasedBeforePresent = m_Lifetime.releases.load() == 1;
+        if (!m_CompleteDuringPreparation) completeFence();
+        auto feedback = FakeVrrFramePresenter::presentAdaptive(request);
+        const auto submission = feedback;
+        feedback = m_Readiness;
+        feedback.presented = submission.presented;
+        feedback.cancelled = submission.cancelled;
+        feedback.submissionTimeValid = submission.submissionTimeValid;
+        feedback.submissionTimeUs = submission.submissionTimeUs;
+        feedback.nativeBackendValid = true;
+        // Composition uses the same D3D11 fence but has a portable serial-ID
+        // acceptance contract. This fixture has no real DXGI capability or
+        // display-statistics queries and must not claim their evidence.
+        feedback.nativeBackend = VrrNativePresentationBackend::Composition;
+        feedback.nativePresentResultValid = true;
+        feedback.nativePresentTimingValid = true;
+        feedback.nativePresentStartUs = feedback.submissionTimeUs;
+        feedback.nativePresentEndUs = LiGetMicroseconds();
+        feedback.submissionIdValid = feedback.presented;
+        feedback.submissionId = 1;
+        return feedback;
+    }
+
+    std::atomic_bool sourceReleasedBeforePresent { false };
+
+private:
+    void completeFence()
+    {
+        const uint64_t waitStartUs = LiGetMicroseconds();
+        m_Readiness.gpuReadyPollStartUs = waitStartUs;
+        m_Readiness.gpuReadyPollEndUs = waitStartUs;
+        m_Readiness.gpuReadyWaitStartUs = waitStartUs;
+        if (g_FrozenTestClockUs.load()) m_Clock.advance(m_GpuWorkUs);
+        else g_TestClockOffsetUs.fetch_add(static_cast<int64_t>(m_GpuWorkUs));
+        m_Readiness.gpuReadyTimeUs = LiGetMicroseconds();
+        m_Readiness.gpuReadyWaitResultValid = true;
+        m_Readiness.gpuReadyTimingValid = true;
+    }
+
+    FrozenTestClock& m_Clock;
+    TrackedFrameLifetime& m_Lifetime;
+    const bool m_CompleteDuringPreparation;
+    const uint64_t m_GpuWorkUs;
+    VrrPresentFeedback m_Readiness;
+};
+
+void testD3D11ReadinessBeforeTarget()
+{
+    for (const bool completeInPrepare : {false, true}) {
+        for (const uint64_t gpuWorkUs : {uint64_t(1000), uint64_t(30000)}) {
+            resetFakeClock();
+            QTemporaryDir directory;
+            const QString tracePath = directory.filePath("d3d11-readiness.vrrtrace");
+            qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+            qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+            FrozenTestClock clock;
+            TrackedFrameLifetime lifetime;
+            D3D11ReadinessPresenter backend(clock, lifetime, completeInPrepare, gpuWorkUs);
+            PacerTelemetry telemetry;
+            {
+                VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+                expect(worker.start(), "D3D11 readiness fixture must start");
+                worker.submit(frame(1, lifetime));
+                expect(backend.waitForPresentCount(1),
+                       "both early and late GPU completion must present their completed image");
+                expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 1; }),
+                       "D3D11 readiness telemetry must include the completed image");
+                expect(backend.sourceReleasedBeforePresent.load() == completeInPrepare,
+                       "only verified prepare-time completion may release the decoder surface before Present");
+            }
+            expect(lifetime.releases == 1,
+                   "both fence placements must release the decoder input exactly once");
+            const auto lines = readExpandedTrace(tracePath).split('\n');
+            const auto columns = lines.value(0).split(',');
+            const auto fields = lines.value(1).split(',');
+            const auto value = [&](const char* name) {
+                return fields.value(columns.indexOf(name)).toULongLong();
+            };
+            expect(fields.size() == columns.size() && value("presented") == 1 &&
+                       value("gpu_ready_timing_valid") == 1 &&
+                       value("gpu_ready_wait_result_valid") == 1 &&
+                       value("gpu_ready_wait_result") == 0 &&
+                       value("gpu_ready_wait_us") >= gpuWorkUs &&
+                       value("submission_boundary_us") >= value("target_us"),
+                   "successful GPU completion must retain readiness evidence and respect the cadence target");
+            if (completeInPrepare) {
+                expect(value("gpu_ready_time_us") <= value("prepare_end_us") &&
+                           value("prepare_end_us") <= value("target_wait_entry_us") &&
+                           value("gpu_ready_wait_start_us") < value("prepare_end_us"),
+                       "the render fence must complete during preparation before the target hold begins");
+                expect(gpuWorkUs == 1000 ?
+                           value("gpu_ready_time_us") < value("target_us") :
+                           (value("gpu_ready_time_us") > value("target_us") &&
+                            value("target_deadline_already_elapsed") == 1),
+                       "readiness must precede a reachable target and preserve an elapsed target when rendering is late");
+                expect(telemetryStats(telemetry).vrrGpuReadyWaitUs == value("gpu_ready_wait_us"),
+                       "prepare-time GPU service must be counted once even when final feedback repeats the completion");
+            }
+            else {
+                expect(value("gpu_ready_wait_start_us") >= value("prepare_end_us") &&
+                           value("gpu_ready_wait_start_us") >= value("present_start_us"),
+                       "historical deferred-fence traces must retain their distinct Present-time placement");
+            }
+            if (const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_D3D11_READINESS_TRACE")) {
+                if (*exportPath) {
+                    const QString destination = QString::fromLocal8Bit(exportPath) +
+                        (completeInPrepare ? ".prepare" : ".deferred") +
+                        (gpuWorkUs == 1000 ? ".ready.vrrtrace" : ".late.vrrtrace");
+                    QFile::remove(destination);
+                    expect(QFile::copy(tracePath, destination),
+                           "both fence placements must export unchanged schema fixtures for exact replay");
+                }
+            }
+            qputenv("MOONLIGHT_VRR_TRACE", "");
+            qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+        }
+    }
+}
+
+void testSynchronizedCompositionFeedback()
+{
+    resetFakeClock();
+    QTemporaryDir traceDirectory;
+    expect(traceDirectory.isValid(), "composition feedback trace directory must exist");
+    const QString tracePath = traceDirectory.filePath("composition-feedback.vrrtrace");
+    qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+    SynchronizedCompositionPresenter backend;
+    backend.setCanLatch(true);
+    auto config = enabledConfig();
+    config.streamRateHz = 116;
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime[24];
+    {
+        VrrPacingWorker worker(&backend, config, &telemetry);
+        expect(worker.start(), "composition feedback worker must start");
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < 24; ++i) {
+            const uint32_t ticks = uint32_t(uint64_t(i) * 90000 / 116);
+            std::this_thread::sleep_until(start + std::chrono::microseconds(uint64_t(ticks) * 100 / 9));
+            worker.submit(makeTrackedPacedFrame(i + 1, ticks, LiGetMicroseconds(), lifetime[i]));
+            expect(backend.waitForPresentCount(size_t(i + 1)),
+                   "composition fixture must submit each frame");
+        }
+        expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 24; }),
+               "composition telemetry must include the final result");
+    }
+    const auto requests = backend.presentRequests();
+    expect(requests.size() == 24 && std::all_of(requests.begin(), requests.end(),
+        [](const VrrPresentRequest& request) { return request.latchedPresentation; }),
+        "the worker must request native synchronization on every composition frame");
+    const auto graph = telemetry.timingGraphSnapshot().points;
+    size_t displayIntervals = 0;
+    for (size_t i = 0; i < graph.size(); ++i) {
+        uint64_t interval;
+        displayIntervals += Overlay::timingGraphInterval(graph, i, Overlay::TimingGraphLane::Display, interval);
+    }
+    expect(displayIntervals == 22,
+           "delayed composition display events must populate the magenta lane for their own frames");
+    const auto lines = readExpandedTrace(tracePath).split('\n');
+    const auto columns = lines.value(0).split(',');
+    const int capability = columns.indexOf("param_native_synchronized_presentation");
+    expect(capability >= 0 && lines.value(1).split(',').value(capability) == "1",
+           "exact replay must capture the presenter's constant synchronized mode");
+    if (const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_COMPOSITION_TRACE")) {
+        if (*exportPath) expect(QFile::copy(tracePath, QString::fromLocal8Bit(exportPath)),
+                              "composition feedback fixture must export for exact replay");
+    }
+    qputenv("MOONLIGHT_VRR_TRACE", "");
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+}
+
+void testDxgiConfirmedRefreshFeedback()
+{
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        resetFakeClock();
+        const bool virtualizationDisabled = scenario != 0;
+        const bool disjoint = scenario == 2;
+        DelayedDxgiRefreshPresenter backend(virtualizationDisabled, disjoint ? 4 : 0);
+        auto config = enabledConfig();
+        config.streamRateHz = 116;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime[6];
+        {
+            VrrPacingWorker worker(&backend, config, &telemetry);
+            expect(worker.start(), "DXGI refresh feedback worker must start");
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < 6; ++i) {
+                const uint32_t ticks = uint32_t(uint64_t(i) * 90000 / 116);
+                std::this_thread::sleep_until(start +
+                    std::chrono::microseconds(uint64_t(ticks) * 100 / 9));
+                worker.submit(makeTrackedPacedFrame(i + 1, ticks,
+                    LiGetMicroseconds(), lifetime[i]));
+                expect(backend.waitForPresentCount(size_t(i + 1)),
+                       "DXGI refresh fixture must submit each frame");
+            }
+            expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 6; }),
+                   "DXGI refresh telemetry must include the final result");
+        }
+        const auto graph = telemetry.timingGraphSnapshot().points;
+        expect(graph.size() == 6, "DXGI refresh graph must retain every submitted frame");
+        size_t confirmedFrames = 0, confirmedIntervals = 0;
+        for (size_t i = 0; i < graph.size(); ++i) {
+            const auto& point = graph[i];
+            if (point.displayUs) {
+                ++confirmedFrames;
+                expect(point.displayKind == Overlay::TimingGraphDisplayKind::ConfirmedRefresh &&
+                           point.displayUs == point.submissionUs + 1000,
+                       "delayed DXGI refresh feedback must match its own earlier submission without becoming a display event");
+            }
+            uint64_t interval = 0;
+            confirmedIntervals += Overlay::timingGraphInterval(
+                graph, i, Overlay::TimingGraphLane::Display, interval);
+        }
+        expect(confirmedFrames == (virtualizationDisabled ? (disjoint ? 4 : 5) : 0) &&
+                   confirmedIntervals == (virtualizationDisabled ? (disjoint ? 2 : 4) : 0),
+               "only unvirtualized DXGI refresh evidence may populate the graph, with no join across disjoint statistics");
+        const auto stats = telemetryStats(telemetry);
+        expect(stats.vrrCadenceIntervals == 0 && stats.vrrCadenceHitches == 0,
+               "confirmed DXGI refresh timing must not populate native display-event diagnostics");
+        for (const auto& frameLifetime : lifetime)
+            expect(frameLifetime.releases == 1,
+                   "DXGI refresh feedback must release each source frame exactly once");
+    }
+}
+
+void testDxgiGuardWithoutAlignmentTrace()
+{
+    resetFakeClock();
+    // This fixture tests native guard evidence at an eligible source cadence.
+    // Advance virtual time on clock samples so both producer and worker
+    // scheduling are independent of host descheduling. Native probes still
+    // freeze their own operation below through FrozenTestClock.
+    g_SteppedTestClockUs.store(1000000);
+    QTemporaryDir directory;
+    expect(directory.isValid(), "DXGI guard trace directory must exist");
+    const QString tracePath = directory.filePath("dxgi-guard.vrrtrace");
+    const QByteArray previousTrace = qgetenv("MOONLIGHT_VRR_TRACE");
+    const QByteArray previousDeep = qgetenv("MOONLIGHT_VRR_DEEP_TRACE");
+    const QByteArray previousAlignment = qgetenv("MOONLIGHT_VRR_ALIGN");
+    qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+    qputenv("MOONLIGHT_VRR_ALIGN", "0");
+    GuardOnlyDxgiPresenter backend;
+    backend.setCanLatch(true);
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime[4];
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "DXGI guard trace worker must start");
+        const uint64_t sourceStartUs = g_SteppedTestClockUs.load();
+        for (int i = 0; i < 4; ++i) {
+            const uint64_t sourceSlotUs = sourceStartUs + uint64_t(i) * 16667;
+            expect(i == 0 || g_SteppedTestClockUs.load() <= sourceSlotUs,
+                   "native guard fixture must complete before its next source slot");
+            if (i != 0) g_SteppedTestClockUs.store(sourceSlotUs);
+            worker.submit(frame(i + 1, lifetime[i]));
+            expect(backend.waitForPresentCount(size_t(i + 1)),
+                   "DXGI guard fixture must present every frame");
+            expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == uint64_t(i + 1); }),
+                   "native guard fixture must finish each slot before advancing input time");
+        }
+        expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 4; }),
+               "DXGI guard telemetry must contain the final result");
+    }
+    g_SteppedTestClockUs.store(0);
+    const auto expanded = readExpandedTrace(tracePath);
+    const auto lines = expanded.split('\n');
+    const auto columns = lines.value(0).split(',');
+    int rows = 0;
+    for (int i = 1; i < lines.size(); ++i) {
+        if (lines[i].isEmpty() || lines[i].startsWith("#vrr_trace_footer,")) continue;
+        const auto fields = lines[i].split(',');
+        const auto value = [&](const char* name) {
+            return fields.value(columns.indexOf(name)).toULongLong();
+        };
+        ++rows;
+        expect(fields.size() == columns.size() && value("trace_schema") == 5 &&
+                   value("native_raster_sampling_requested") == 0 &&
+                   value("native_raster_after_query_result_valid") == 0 &&
+                   value("latch_valid") == 0 && value("latch_time_kind") == 0,
+               "guard-only trace must retain schema 5 without alignment, after probes, or fabricated display events");
+        const bool adaptive = rows == 2;
+        expect(value("native_present_sync_interval") == (adaptive ? 0 : 1) &&
+                   value("native_present_flags") == (adaptive ? 0x200 : 0) &&
+                   value("flip_protection_latched") == (adaptive ? 0 : 1),
+               "unknown, active, and failed guard evidence must synchronize while a fresh blank remains adaptive");
+        if (rows > 1) {
+            expect(value("native_raster_before_query_result_valid") == 1 &&
+                       value("native_present_timing_valid") == 1 &&
+                       value("flip_protection_checked") == 1 &&
+                       value("flip_protection_pending") == 0 &&
+                       value("flip_protection_query_start_us") <= value("native_raster_before_query_start_us") &&
+                       value("native_raster_before_query_start_us") <= value("native_raster_before_query_end_us") &&
+                       value("native_raster_before_query_end_us") <= value("flip_protection_query_end_us") &&
+                       value("flip_protection_query_end_us") <= value("native_present_start_us"),
+                   "before-only guard evidence must retain native timing and its enclosing decision bracket");
+        }
+    }
+    expect(rows == 4, "DXGI guard trace must contain every controller decision");
+    expect(telemetryStats(telemetry).vrrCadenceIntervals == 0,
+           "guard raster timing must not populate native display-event cadence");
+    for (const auto& frameLifetime : lifetime)
+        expect(frameLifetime.releases == 1, "DXGI guard fixture must release each source once");
+    if (const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_GUARD_TRACE")) {
+        if (*exportPath) {
+            QFile exported(QString::fromLocal8Bit(exportPath));
+            expect(exported.open(QIODevice::WriteOnly) &&
+                       exported.write(expanded) == expanded.size(),
+                   "guard-only trace must export complete CSV replay input");
+        }
+    }
+    qputenv("MOONLIGHT_VRR_TRACE", previousTrace);
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", previousDeep);
+    qputenv("MOONLIGHT_VRR_ALIGN", previousAlignment);
+}
+
+void testMetalPresentationFeedback()
+{
+    for (uint64_t uncertaintyUs : {uint64_t(250), uint64_t(501)}) {
+        resetFakeClock();
+        QTemporaryDir traceDirectory;
+        expect(traceDirectory.isValid(), "Metal feedback trace directory must exist");
+        const QString tracePath = traceDirectory.filePath("metal-feedback.vrrtrace");
+        qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+        qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+
+        MetalFeedbackPresenter backend;
+        backend.uncertaintyUs = uncertaintyUs;
+        // Force the shared controller to request protected slots near refresh,
+        // then return to wider source spacing. Metal's native mode is constant.
+        backend.setCanLatch(true);
+        auto config = enabledConfig();
+        config.streamRateHz = 120;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime[40];
+        {
+            VrrPacingWorker worker(&backend, config, &telemetry);
+            expect(worker.start(), "Metal feedback worker must start");
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < 40; ++i) {
+                const int ticks = i < 24 ? i * 750 : 24 * 750 + (i - 24) * 1500;
+                std::this_thread::sleep_until(start + std::chrono::microseconds(int64_t(ticks) * 100 / 9));
+                worker.submit(makeTrackedPacedFrame(i + 1, uint32_t(ticks),
+                                                   LiGetMicroseconds(), lifetime[i]));
+                expect(backend.waitForPresentCount(size_t(i + 1)),
+                       "Metal feedback fixture must submit each frame");
+            }
+            expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == 40; }),
+                   "Metal feedback telemetry must include the final result");
+        }
+
+        const auto requests = backend.presentRequests();
+        bool hadLatchedRequest = false;
+        bool returnedToAdaptive = false;
+        for (const auto& request : requests) {
+            hadLatchedRequest |= request.latchedPresentation;
+            returnedToAdaptive |= hadLatchedRequest && !request.latchedPresentation;
+        }
+        expect(hadLatchedRequest && returnedToAdaptive,
+               "Metal feedback fixture must cross requested latch modes");
+        expect(uncertaintyUs <= 500 ? telemetryStats(telemetry).vrrCadenceIntervals > 15 :
+                                    telemetryStats(telemetry).vrrCadenceIntervals == 0,
+               "only matched Metal display events with bounded clock uncertainty may count native cadence");
+
+        const auto expanded = readExpandedTrace(tracePath);
+        const auto lines = expanded.split('\n');
+        const auto columns = lines.value(0).split(',');
+        uint64_t rows = 0, samples = 0;
+        for (int i = 1; i < lines.size(); ++i) {
+            if (lines[i].isEmpty() || lines[i].startsWith("#vrr_trace_footer,")) continue;
+            const auto fields = lines[i].split(',');
+            const auto field = [&](const char* name) { return fields.value(columns.indexOf(name)).toULongLong(); };
+            ++rows;
+            expect(fields.size() == columns.size() &&
+                       field("native_backend_valid") == 1 && field("native_backend") == 4 &&
+                       field("native_present_result_valid") == 1 && field("native_present_result") == 0 &&
+                       field("submission_id_valid") == 1 && field("submission_id") == rows &&
+                       field("native_present_parameters_valid") == 0 && field("native_vrr_state_valid") == 0 &&
+                       field("submission_id_query_result_valid") == 0 && field("frame_stats_query_result_valid") == 0 &&
+                       field("latch_raw_sync_qpc_valid") == 0 && field("latch_qpc_correlation_valid") == 0 &&
+                       field("gpu_ready_timing_valid") == 1 && field("gpu_ready_wait_result_valid") == 1 &&
+                       field("gpu_ready_wait_result") == 0 &&
+                       field("gpu_ready_signal_result_valid") == 0 && field("gpu_ready_set_event_result_valid") == 0 &&
+                       field("gpu_ready_fence_value") == 0 &&
+                       field("gpu_ready_completion_lower_bound_us") == field("gpu_ready_poll_start_us") &&
+                       field("gpu_ready_completion_upper_bound_us") == field("gpu_ready_time_us"),
+                   "Metal trace must retain serial IDs and native acceptance without fabricating DXGI evidence");
+            if (rows > 1) {
+                ++samples;
+                expect(field("latch_valid") == 1 && field("latch_time_kind") == 2 &&
+                           field("latch_submission_id") == rows - 1 &&
+                           field("presentation_uncertainty_us") == uncertaintyUs,
+                       "Metal trace must preserve delayed display-event identity and clock uncertainty");
+            }
+        }
+        expect(rows == 40 && samples == 39, "Metal fixture must retain every frame and delayed display event");
+        for (const auto& frameLifetime : lifetime)
+            expect(frameLifetime.releases == 1, "Metal feedback must preserve source-frame ownership");
+
+        if (uncertaintyUs == 250) {
+            const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_METAL_TRACE");
+            if (exportPath && exportPath[0]) {
+                QFile exported(QString::fromLocal8Bit(exportPath));
+                expect(exported.open(QIODevice::WriteOnly) && exported.write(expanded) == expanded.size(),
+                       "Metal feedback fixture must export complete replay input");
+            }
+        }
+        qputenv("MOONLIGHT_VRR_TRACE", "");
+        qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+    }
+}
+
+void testMetalFailedPreparationFeedback()
+{
+    resetFakeClock();
+    QTemporaryDir traceDirectory;
+    const QString tracePath = traceDirectory.filePath("metal-preparation-failed.vrrtrace");
+    qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+    MetalFeedbackPresenter backend;
+    backend.failPreparation = true;
+    PacerTelemetry telemetry;
+    TrackedFrameLifetime lifetime;
+    {
+        VrrPacingWorker worker(&backend, enabledConfig(), &telemetry);
+        expect(worker.start(), "failed Metal preparation worker must start");
+        worker.submit(frame(1, lifetime));
+        expect(backend.waitForCancelCount(1), "failed Metal preparation must release its drawable");
+    }
+    const auto expanded = readExpandedTrace(tracePath);
+    const auto lines = expanded.split('\n');
+    const auto columns = lines.value(0).split(',');
+    const auto fields = lines.value(1).split(',');
+    const auto value = [&](const char* name) { return fields.value(columns.indexOf(name)).toULongLong(); };
+    expect(fields.value(columns.indexOf("disposition")) == "preparation_failed" &&
+               value("native_backend_valid") == 0 && value("native_present_result_valid") == 0 &&
+               value("submission_id_valid") == 0 && value("cancelled") == 1 && value("presented") == 0 &&
+               value("gpu_ready_attempted") == 1 && value("gpu_ready_wait_result_valid") == 1 &&
+               value("gpu_ready_wait_result") == 2 && value("gpu_ready_timing_valid") == 0 &&
+               value("gpu_ready_poll_end_us") >= value("gpu_ready_poll_start_us") &&
+               value("gpu_ready_signal_result_valid") == 0 && value("gpu_ready_set_event_result_valid") == 0,
+           "failed Metal preparation must preserve GPU failure while retaining no native Present evidence");
+    expect(lifetime.releases == 1, "failed Metal preparation must free its input once");
+    const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_METAL_TRACE");
+    if (exportPath && exportPath[0]) {
+        QFile exported(QString::fromLocal8Bit(exportPath) + QStringLiteral(".failed"));
+        expect(exported.open(QIODevice::WriteOnly) && exported.write(expanded) == expanded.size(),
+               "failed Metal preparation fixture must export complete replay input");
+    }
+    qputenv("MOONLIGHT_VRR_TRACE", "");
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+}
+
 void testReconnectPreservesCompletedTraces()
 {
     resetFakeClock();
@@ -2266,6 +3436,8 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     TrackedFrameLifetime first;
 
     auto cachedConfig = enabledConfig();
+    // Exercise a combination that cannot be reconstructed from a preset name.
+    cachedConfig.timingOptions = {750, 9725, 30, 1500};
     cachedConfig.calibrationPath = traceDirectory.filePath("profile.json").toStdString();
     cachedConfig.calibrationKey = "replay-test";
     Vrr13::Reserve cachedHistory(20);
@@ -2273,10 +3445,15 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
         cachedHistory.observe(4000000, 8000000, Vrr13::Reserve::Second + int64_t(i) * 16667000);
     expect(Vrr13::saveProfile(QString::fromStdString(cachedConfig.calibrationPath),
                              "replay-test", cachedHistory), "test calibration must save");
+    constexpr uint64_t startupSeedUs = 8000;
+    expect(Vrr13::saveStartDelay(traceDirectory.filePath("vrr-start-delay.json"),
+                                "replay-test", startupSeedUs),
+           "warm startup fixture must save its settled delay seed");
     {
         VrrPacingWorker worker(&backend, cachedConfig, &telemetry);
         expect(worker.start(), "worker must start for deep diagnostics testing");
         auto input = frame(1, first);
+        input.setLostPackets(12);
         worker.submit(std::move(input));
         expect(backend.waitForPresentCount(1),
                "deep diagnostics must not suppress presentation");
@@ -2295,6 +3472,10 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     const QList<QByteArray> columns = header.split(',');
     const QList<QByteArray> fields = row.split(',');
     expect(columns.size() == fields.size(), "diagnostic columns must align with every value");
+    expect(fields.value(columns.indexOf("param_playout_delay_start_seed_us")).toULongLong() == startupSeedUs,
+           "trace must retain the loaded warm startup seed used by the controller");
+    expect(columns.contains("lost_packets") && fields.value(columns.indexOf("lost_packets")) == "12",
+           "trace must preserve packet loss so replay can reproduce buffer eligibility");
     expect(columns.contains("decoder_output_us") &&
                fields.value(columns.indexOf("decoder_output_us")).toULongLong() > 0 &&
                fields.value(columns.indexOf("decoder_output_us")).toULongLong() ==
@@ -2307,6 +3488,11 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
                fields.value(columns.indexOf("history_version")) == "20" &&
                fields.value(columns.indexOf("history_state_valid")) == "1",
            "capture must identify the active preset and loaded calibration independently of native present results");
+    expect(fields.value(columns.indexOf("param_playout_delay_maximum_period_per_mille")) == "750" &&
+           fields.value(columns.indexOf("param_playout_on_time_target_per_million")) == "972500" &&
+           fields.value(columns.indexOf("param_playout_readiness_window_us")) == "30000000" &&
+           fields.value(columns.indexOf("param_playout_interval_tolerance_us")) == "1500",
+           "capture must record the actual custom settings rather than the preset defaults");
     expect(columns.contains("presentation_uncertainty_us") &&
            fields.value(columns.indexOf("presentation_uncertainty_us")) == "0",
            "trace must preserve non-DXGI clock uncertainty, defaulting to zero for legacy presenters");
@@ -2318,8 +3504,8 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
     expect(restored.loadProfile(profile) && restored.common() == 4000000 && restored.evidence() == 0,
            "captured calibration must restore prior history without inventing fresh successes");
     expect(fields.value(columns.indexOf("param_playout_prediction_only")) == "1" &&
-               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "7" &&
-               fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "2" &&
+               fields.value(columns.indexOf("param_playout_responsive_buffer")) == "12" &&
+               fields.value(columns.indexOf("param_playout_smoothing_windowed_cadence")) == "4" &&
                fields.value(columns.indexOf("param_playout_native_hitch_adaptation")) == "0",
            "capture must identify production interval-quality adaptation for exact replay");
     expect(header.contains("frame_receive_us") &&
@@ -2416,6 +3602,268 @@ void testDeepTraceRequestsNativeObservationsWithoutChangingMode()
 
     qputenv("MOONLIGHT_VRR_TRACE", "");
     qputenv("MOONLIGHT_VRR_DEEP_TRACE", "0");
+}
+
+void testTrajectoryReadySuccessorReservation() {
+    resetFakeClock();
+    g_TestClockOffsetUs.store(1000000); // Delivery stages precede first output without unsigned underflow.
+    const auto oldAdaptive=qgetenv("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER");
+    const auto oldBounded=qgetenv("MOONLIGHT_VRR_BOUNDED_CATCHUP");
+    const auto oldTrace=qgetenv("MOONLIGHT_VRR_TRACE");
+    const auto oldDeep=qgetenv("MOONLIGHT_VRR_DEEP_TRACE");
+    qputenv("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER","1");qputenv("MOONLIGHT_VRR_BOUNDED_CATCHUP","1");qputenv("MOONLIGHT_VRR_DEEP_TRACE","1");
+    QTemporaryDir directory;const auto path=directory.filePath("trajectory-reservation.vrrtrace");qputenv("MOONLIGHT_VRR_TRACE",QFile::encodeName(path));
+    NativeScheduledPresenter backend;backend.lateAttempt=64;backend.lateExtraUs=1000;backend.blockDecodeFrame(65);
+    PacerTelemetry telemetry;TrackedFrameLifetime life[66];
+    auto config=enabledConfig();config.streamRateHz=120;config.displayRefreshHz=120;
+    config.timingOptions.targetHundredths=9950;config.timingOptions.historySeconds=200;
+    {
+        VrrPacingWorker worker(&backend,config,&telemetry);expect(worker.start(),"trajectory reservation worker starts");
+        const uint64_t sourceOrigin=LiGetMicroseconds();
+        const auto input=[&](int i,uint64_t outputUs) {auto f=makeTrackedPacedFrame(i,uint32_t((i-1)*750),outputUs,life[i-1]);
+            const auto hostProduction=sourceOrigin-20000+uint64_t(i-1)*8333;
+            expect(hostProduction<=outputUs-600 && outputUs<=LiGetMicroseconds(),
+                   "network bunching remains after sender production and completed output precedes observation");
+            f.setDeliveryTimeline(outputUs-800,outputUs-600,outputUs-500);
+            if(i==24) f.setLostPackets(1);
+            if(i==64) f.setDecoderOutputComplete(false);
+            return f;};
+        for(int i=1;i<=64;++i) {
+            const auto output=sourceOrigin+uint64_t(i-1)*8333;
+            while(LiGetMicroseconds()<output) SDL_Delay(1);
+            worker.submit(input(i,output));
+            expect(backend.waitForPresentCount(i),"warmup establishes qualified accepted source cadence");
+        }
+        const auto bunchedOutput=LiGetMicroseconds();
+        FrozenTestClock acceptedClock;
+        worker.submit(input(65,bunchedOutput-200));expect(backend.waitForDecodeWaitCount(1),"active successor is held before scheduling to admit known-ready replacement");
+        worker.submit(input(66,bunchedOutput-100));
+        acceptedClock.resume(); // Preserve late anchor, permit waits, and never claim future output complete.
+        backend.releaseDecode();
+        expect(backend.waitForPresentCount(66),"late frame is held and shown, then its successor; nothing is skipped");
+    }
+    g_FrozenTestClockUs.store(0);
+    const auto rows=readExpandedTrace(path).split('\n');const auto columns=rows.value(0).split(',');
+    int dropped=0,presented=0;bool reservationProof=false;
+    for(int i=1;i<rows.size();++i) {if(rows[i].isEmpty()||rows[i].startsWith("#"))continue;const auto f=rows[i].split(',');
+        const bool drop=f.value(columns.indexOf("trajectory_resync_dropped"))=="1";
+        if(drop) {++dropped;reservationProof=f.value(columns.indexOf("trajectory_successor_frame")).toLongLong()==66 &&
+            f.value(columns.indexOf("trajectory_successor_proof")).toULongLong()==2;}
+        presented+=f.value(columns.indexOf("disposition"))=="presented";
+    }
+    const auto graph=telemetry.timingGraphSnapshot().points;
+    size_t matched=0,eligible=0,ineligible=0,distinctTarget=0;
+    bool lossIneligible=false,unknownGpuEligible=false;
+    for(const auto& point:graph) {
+        bool found=false;
+        for(int i=1;i<rows.size();++i) {
+            if(rows[i].isEmpty()||rows[i].startsWith("#"))continue;
+            const auto fields=rows[i].split(',');
+            const auto u=[&](const char* n){return fields.value(columns.indexOf(n)).toULongLong();};
+            if(fields.value(columns.indexOf("disposition"))!="presented" || u("submission_boundary_us")!=point.submissionUs)continue;
+            found=true; ++matched;
+            const bool expectedEligible=u("param_playout_input_percentile_enabled") && u("input_percentile_last_input_eligible") &&
+                u("input_percentile_last_input_observation_us")==point.submissionUs;
+            if(point.producerEligible!=expectedEligible) std::fprintf(stderr,"graph eligibility mismatch: frame=%s cpu=%llu eligible=%d expected=%d graphEnabled=%d lastObserved=%llu lastEligible=%llu\n",fields.value(columns.indexOf("frame")).constData(),(unsigned long long)point.submissionUs,point.producerEligible,expectedEligible,point.inputPercentileEnabled,(unsigned long long)u("input_percentile_last_input_observation_us"),(unsigned long long)u("input_percentile_last_input_eligible"));
+            expect(point.producerEligible==expectedEligible,
+                   "published producer eligibility belongs to the same CPU submission, including cold invalid input");
+            expect(point.producerRequiredUs==fields.value(columns.indexOf("input_percentile_last_input_required_us")).toLongLong(),
+                   "graph producer requirement copies the exact signed causal controller observation");
+            expect(point.inputToleranceUs==u("param_playout_input_percentile_tolerance_us"),
+                   "worker graph copies actual adaptive input tolerance independently of interval display tolerance");
+            expect(point.inputTargetUs==u("input_percentile_target_us") && point.inputProbabilityPpm==995000 && point.inputWindowUs==200000000,
+                   "graph copies the long-profile quantile target and effective user probability/history");
+            expect(point.inputSamples==u("input_percentile_recent_eligible") && point.inputAbsorbed==u("input_percentile_recent_absorbed") &&
+                point.inputMissed==u("input_percentile_recent_missed") && point.trajectoryCarryUs==u("trajectory_carry_us"),
+                   "graph copies current-window causal outcomes and same-plan pacing carry");
+            if(u("frame")==24) lossIneligible=!point.producerEligible && u("lost_packets")==1;
+            if(u("frame")==64) unknownGpuEligible=point.producerEligible && point.decoderReadyUs==0;
+            eligible+=point.producerEligible; ineligible+=!point.producerEligible; distinctTarget+=point.inputTargetUs!=point.bufferUs;
+            break;
+        }
+        expect(found,"every graph point matches its own presented trace row rather than a predecessor observation");
+    }
+    expect(matched==66 && eligible>0 && ineligible>0 && distinctTarget>0,
+           "worker graph fixture exercises qualified and cold-invalid observations and a quantile distinct from applied buffer");
+    expect(lossIneligible && unknownGpuEligible,"worker does not promote packet-loss input but retains causal eligibility when GPU completion is unknown");
+    (void) reservationProof;
+    expect(dropped==0 && presented==66,"bounded catch-up never skips a frame to regain phase");
+    for(const auto& lifetime:life) expect(lifetime.releases==1,"reservation and shutdown account every frame exactly once");
+    if(const auto output=SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_TRAJECTORY_RESERVATION_TRACE")) {
+        QFile::remove(QString::fromLocal8Bit(output));expect(QFile::copy(path,QString::fromLocal8Bit(output)),"reservation fixture exports for strict replay");
+    }
+    const auto restore=[](const char* n,const QByteArray& v){if(v.isNull())qunsetenv(n);else qputenv(n,v);};
+    restore("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER",oldAdaptive);restore("MOONLIGHT_VRR_BOUNDED_CATCHUP",oldBounded);
+    restore("MOONLIGHT_VRR_TRACE",oldTrace);restore("MOONLIGHT_VRR_DEEP_TRACE",oldDeep);
+}
+
+void testExperimentalInputPercentileActivationTrace()
+{
+    const QByteArray priorMode = qgetenv("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER");
+    const QByteArray priorLegacy = qgetenv("MOONLIGHT_VRR_EXPERIMENTAL_INPUT_PERCENTILE");
+    const QByteArray priorHistory = qgetenv("MOONLIGHT_VRR_INPUT_HISTORY_SECONDS");
+    const QByteArray priorTrace = qgetenv("MOONLIGHT_VRR_TRACE");
+    const QByteArray priorDeep = qgetenv("MOONLIGHT_VRR_DEEP_TRACE");
+    qputenv("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER", "1");
+    // The retired percentage switch must not override the profile target.
+    qputenv("MOONLIGHT_VRR_EXPERIMENTAL_INPUT_PERCENTILE", "99.99");
+    qputenv("MOONLIGHT_VRR_INPUT_HISTORY_SECONDS", "60");
+    qputenv("MOONLIGHT_VRR_DEEP_TRACE", "1");
+    struct LogCapture { std::mutex mutex; std::vector<std::string> messages; } logs;
+    SDL_LogOutputFunction previousOutput = nullptr;void* previousData = nullptr;
+    SDL_LogGetOutputFunction(&previousOutput, &previousData);
+    const auto previousPriority = SDL_LogGetPriority(SDL_LOG_CATEGORY_APPLICATION);
+    SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, SDL_LOG_PRIORITY_INFO);
+    SDL_LogSetOutputFunction([](void* data, int, SDL_LogPriority, const char* message) {
+        auto* capture = static_cast<LogCapture*>(data);
+        std::lock_guard<std::mutex> lock(capture->mutex);
+        capture->messages.emplace_back(message);
+    }, &logs);
+    struct Case { int mode, target, history; };
+    const Case cases[] = {{0,0,0},{1,0,0},{2,0,0},{1,9900,10},{1,9950,200},{1,9999,300},{1,-1,1},{1,10000,999}};
+    // Production default: enabled unless MOONLIGHT_VRR_BOUNDED_CATCHUP=0.
+    const bool expectedBoundedCatchup = qEnvironmentVariable("MOONLIGHT_VRR_BOUNDED_CATCHUP")!="0";
+    for (size_t caseIndex=0;caseIndex<std::size(cases);++caseIndex) {
+        resetFakeClock();
+        QTemporaryDir directory;
+        expect(directory.isValid(), "adaptive activation trace needs a temporary directory");
+        const QString tracePath = directory.filePath("experimental-worker.vrrtrace");
+        qputenv("MOONLIGHT_VRR_TRACE", QFile::encodeName(tracePath));
+        { std::lock_guard<std::mutex> lock(logs.mutex);logs.messages.clear(); }
+        FakeVrrFramePresenter backend;
+        PacerTelemetry telemetry;
+        TrackedFrameLifetime lifetime[3];
+        auto config = enabledConfig();
+        config.latencyMode = cases[caseIndex].mode;
+        config.timingOptions.targetHundredths = cases[caseIndex].target;
+        config.timingOptions.historySeconds = cases[caseIndex].history;
+        if(caseIndex==4) config.timingOptions.toleranceUs=750; // Exact user99.50percent/200s/0.75ms fixture.
+        const auto normalPolicy = vrrTimingParametersForSession(config);
+        const auto effective = config.timingOptions.resolved(config.latencyMode);
+        const auto expected = uint64_t(effective.targetHundredths)*100;
+        const auto expectedWindow = uint64_t(effective.historySeconds)*1000000;
+        {
+            VrrPacingWorker worker(&backend, config, &telemetry);
+            expect(worker.start(), "experimental adaptive worker must start");
+            for (int i = 0; i < 3; ++i) {
+                if(caseIndex==4 && i>0) g_TestClockOffsetUs.fetch_add(40000);
+                auto input = frame(i + 1, lifetime[i]);
+                input.setDeliveryTimeline(input.decoderOutputUs()-800,input.decoderOutputUs()-600,input.decoderOutputUs()-500);
+                if(caseIndex==4 && i==1) input.setDeliveryTimeline(input.decoderOutputUs()-1000,input.decoderOutputUs()-500,input.decoderOutputUs()-200);
+                if(caseIndex==4 && i==2) input.setDeliveryTimeline(input.decoderOutputUs()-70000,input.decoderOutputUs()-69000,input.decoderOutputUs()-200);
+                worker.submit(std::move(input));
+                expect(backend.waitForPresentCount(size_t(i + 1)),
+                       "adaptive activation fixture must present each input");
+                expect(waitFor([&] { return telemetryStats(telemetry).vrrPresentedFrames == uint64_t(i + 1); }),
+                       "adaptive activation fixture must complete each input");
+            }
+        }
+        bool loggedTarget = false;
+        const std::string expectedText = QString::number(expected/10000.0, 'f', 2).toStdString();
+        { std::lock_guard<std::mutex> lock(logs.mutex);
+          for (const auto& message : logs.messages) {
+              if (message.find("Adaptive buffer") != std::string::npos && message.find(expectedText) != std::string::npos &&
+                  message.find("history " + std::to_string(effective.historySeconds) + " s") != std::string::npos)
+                  loggedTarget = true;
+          }
+        }
+        expect(loggedTarget, "worker startup diagnostic must identify effective profile target and history");
+        const auto lines = readExpandedTrace(tracePath).split('\n');
+        const auto columns = lines.value(0).split(',');
+        int rows = 0;
+        for (int i = 1; i < lines.size(); ++i) {
+            if (lines[i].isEmpty() || lines[i].startsWith("#")) continue;
+            const auto fields = lines[i].split(',');
+            ++rows;
+            expect(fields.size() == columns.size() &&
+                       fields.value(columns.indexOf("param_playout_input_percentile_enabled")) == "1" &&
+                       fields.value(columns.indexOf("param_playout_input_percentile_target_per_million")).toULongLong() == expected &&
+                       fields.value(columns.indexOf("param_playout_input_percentile_window_us")).toULongLong() == expectedWindow,
+                   "worker trace must serialize adaptive probability and history from the effective profile");
+            expect(columns.indexOf("param_bounded_catchup_enabled")>=0 &&
+                       fields.value(columns.indexOf("param_bounded_catchup_enabled")).toULongLong()==uint64_t(expectedBoundedCatchup),
+                   "worker trace captures bounded catchup (default on, =0 opts out) as an independent parameter");
+            expect(columns.indexOf("trajectory_target_us")>=0 && columns.indexOf("trajectory_resync_dropped")>=0 &&
+                       columns.indexOf("trajectory_resync_deferred")>=0 &&
+                       (!expectedBoundedCatchup || fields.value(columns.indexOf("trajectory_plans")).toULongLong()>0),
+                   "worker trace carries planned recovery trajectory and actual resync lifecycle flags");
+            expect(fields.value(columns.indexOf("param_playout_on_time_target_per_million")).toULongLong() ==
+                       normalPolicy.playoutOnTimeTargetPerMillion,
+                   "adaptive activation must preserve selected interval quality target diagnostics");
+            expect(fields.value(columns.indexOf("input_percentile_probability_ppm")).toULongLong() == expected,
+                   "runtime direct-buffer diagnostic must follow the profile target rather than retired environment percentage");
+            expect(fields.value(columns.indexOf("input_percentile_window_us")).toULongLong() == expectedWindow,
+                   "runtime direct-buffer history diagnostic must match the effective profile");
+            expect(columns.indexOf("input_percentile_recent_eligible") >= 0 &&
+                       columns.indexOf("input_percentile_recent_absorbed") >= 0 &&
+                       columns.indexOf("input_percentile_recent_missed") >= 0 &&
+                       fields.value(columns.indexOf("input_percentile_recent_eligible")).toULongLong() <=
+                           fields.value(columns.indexOf("input_percentile_eligible")).toULongLong() &&
+                       fields.value(columns.indexOf("input_percentile_recent_absorbed")).toULongLong() <=
+                           fields.value(columns.indexOf("input_percentile_absorbed")).toULongLong() &&
+                       fields.value(columns.indexOf("input_percentile_recent_missed")).toULongLong() <=
+                           fields.value(columns.indexOf("input_percentile_missed")).toULongLong(),
+                   "trace distinguishes bounded history outcomes from cumulative input outcomes");
+            expect(columns.indexOf("input_percentile_last_input_eligible") >= 0 &&
+                       columns.indexOf("input_percentile_last_input_required_us") >= 0 &&
+                       columns.indexOf("input_percentile_last_input_observation_us") >= 0 &&
+                       columns.indexOf("input_percentile_growth_blocked") >= 0 &&
+                       fields.value(columns.indexOf("input_percentile_last_input_observation_us")).toULongLong() > 0,
+                   "worker trace exposes the causal last-input boundary and blocked-growth diagnostic");
+            if(caseIndex==4 && rows>=2) {
+                const bool network=fields.value(columns.indexOf("input_network_buffer_miss"))=="1";
+                const bool decode=fields.value(columns.indexOf("input_decode_buffer_miss"))=="1";
+                const auto missAt=fields.value(columns.indexOf("input_buffer_miss_observation_us")).toULongLong();
+                const auto until=fields.value(columns.indexOf("input_percentile_hold_until_us")).toULongLong();
+                expect(rows==2 ? network&&decode : !network&&decode,
+                       "real worker forwards causal network-plus-decode and decode-only buffer-line events");
+                expect(missAt>0 && until==0,
+                       "worker stage event retains causal diagnostics without arming a hard decrease pause");
+            }
+            expect(columns.indexOf("input_network_buffer_miss") >= 0 &&
+                       columns.indexOf("input_decode_buffer_miss") >= 0 &&
+                       columns.indexOf("input_buffer_miss_observation_us") >= 0 &&
+                       columns.indexOf("input_percentile_hold_until_us") >= 0 &&
+                       columns.indexOf("input_percentile_hold_remaining_us") >= 0 &&
+                       columns.indexOf("input_percentile_last_buffer_miss_us") >= 0 &&
+                       columns.indexOf("input_percentile_last_network_miss_us") >= 0 &&
+                       columns.indexOf("input_percentile_last_decoder_miss_us") >= 0 &&
+                       columns.indexOf("input_percentile_network_misses") >= 0 &&
+                       columns.indexOf("input_percentile_decoder_misses") >= 0,
+                   "worker trace exposes independent network/decode buffer-line diagnostics");
+            expect(columns.indexOf("input_percentile_release_samples") >= 0 &&
+                       columns.indexOf("input_percentile_release_misses") >= 0 &&
+                       columns.indexOf("input_percentile_release_factor_ppm") >= 0 &&
+                       columns.indexOf("input_percentile_effective_fall_rate_us_per_second") >= 0 &&
+                       columns.indexOf("input_percentile_effective_fall_rate_milli_us_per_second") >= 0 &&
+                       columns.indexOf("input_percentile_proposed_misses") >= 0 &&
+                       fields.value(columns.indexOf("input_percentile_hold_remaining_us")).toULongLong()==0 &&
+                       fields.value(columns.indexOf("input_percentile_release_factor_ppm")).toULongLong()>=100000 &&
+                       fields.value(columns.indexOf("input_percentile_release_factor_ppm")).toULongLong()<=1000000,
+                   "worker trace serializes bounded soft-release feedback without a hard pause");
+        }
+        expect(rows == 3, "adaptive activation trace must retain all three worker outcomes");
+        if (caseIndex==4) {
+            if (const char* exportPath = SDL_getenv("MOONLIGHT_VRR_TEST_EXPORT_INPUT_PERCENTILE_TRACE")) {
+                if (*exportPath) {
+                    QFile::remove(QString::fromLocal8Bit(exportPath));
+                    expect(QFile::copy(tracePath, QString::fromLocal8Bit(exportPath)),
+                           "profile-based adaptive worker trace must export for exact replay");
+                }
+            }
+        }
+    }
+    SDL_LogSetOutputFunction(previousOutput, previousData);
+    SDL_LogSetPriority(SDL_LOG_CATEGORY_APPLICATION, previousPriority);
+    const auto restore = [](const char* name, const QByteArray& value) {
+        if (value.isNull()) qunsetenv(name);
+        else qputenv(name, value);
+    };
+    restore("MOONLIGHT_VRR_EXPERIMENTAL_ADAPTIVE_BUFFER", priorMode);
+    restore("MOONLIGHT_VRR_EXPERIMENTAL_INPUT_PERCENTILE", priorLegacy);
+    restore("MOONLIGHT_VRR_INPUT_HISTORY_SECONDS", priorHistory);
+    restore("MOONLIGHT_VRR_TRACE", priorTrace);
+    restore("MOONLIGHT_VRR_DEEP_TRACE", priorDeep);
 }
 
 void testTraceCapturesAllowTearingWithoutChangingController()
@@ -2533,7 +3981,9 @@ void exportWarmHistoryReplayFixture()
                 expect(backend.waitForPresentCount(120), "feedback fixture must drain before its controlled stall");
                 backend.blockPreparation();
             }
-            worker.submit(frame(i + 1, lifetime[i]));
+            auto paced = frame(i + 1, lifetime[i]);
+            if (i == 120) paced.setLostPackets(12);
+            worker.submit(std::move(paced));
             if (i == 120) {
                 expect(backend.waitForPrepareCount(121), "feedback fixture must enter preparation before its controlled stall");
                 std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -2554,6 +4004,8 @@ extern "C" uint64_t LiGetMicroseconds(void)
 {
     const uint64_t frozenUs = g_FrozenTestClockUs.load();
     if (frozenUs != 0) return frozenUs;
+    if (g_SteppedTestClockUs.load() != 0)
+        return g_SteppedTestClockUs.fetch_add(100);
     const int64_t elapsedUs =
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - g_TestClockOrigin).count();
@@ -2590,8 +4042,125 @@ void testReadinessWindow()
            "old failures must expire and reversed producer lock order must preserve both outcomes");
 }
 
+void testReceiveDeadlineMath()
+{
+    namespace D = VrrReceiveDeadline;
+    const uint64_t nowUs = 5000000000ULL; // beyond 32 bits of microseconds
+    const uint64_t anchor = D::pack(0xFFFFFF00u, nowUs + 3000);
+    expect(D::deadlineUs(anchor, 0xFFFFFF00u, nowUs) == nowUs + 3000,
+           "the anchor frame's deadline must survive 32-bit packing");
+    // 900 ticks later wraps the RTP counter: 900 / 90 kHz = 10 ms.
+    expect(D::deadlineUs(anchor, 0xFFFFFF00u + 900u, nowUs) == nowUs + 13000,
+           "a later frame must extrapolate at the RTP rate across wrap");
+    expect(D::deadlineUs(anchor, 0xFFFFFF00u - 90u, nowUs) == nowUs + 2000,
+           "an earlier frame must extrapolate backwards");
+    expect(D::deadlineUs(anchor, 0xFFFFFF00u + 900000u, nowUs) == 0,
+           "a frame from another source epoch must not use the anchor");
+    expect(D::deadlineUs(0, 0xFFFFFF00u, nowUs) == 0,
+           "no published anchor means no deadline");
+    const uint64_t pastAnchor = D::pack(10, nowUs - 4000);
+    expect(D::deadlineUs(pastAnchor, 10, nowUs) == nowUs - 4000,
+           "a deadline already in the past must stay in the past");
+    expect(D::pack(0, 0) != 0, "a published anchor must never read as unpublished");
+
+    D::RecentDuration cost;
+    expect(!cost.ready(), "reassembly cost must not be used before enough samples");
+    for (uint64_t i = 0; i < D::RecentDuration::kWindow; i++) {
+        cost.observe(1000, 1000 + 1000 + i * 10);
+    }
+    cost.observe(0, 5000);
+    cost.observe(6000, 5000);
+    expect(cost.ready(), "reassembly cost must become ready");
+    const uint64_t p95 = cost.percentileUs();
+    expect(p95 >= 2190 && p95 <= 2220,
+           "reassembly cost must track a high percentile and ignore invalid samples");
+
+    D::RecentDuration gpuCost;
+    for (size_t i = 0; i < D::RecentDuration::kWindow; ++i) {
+        gpuCost.observeGpuCompletion(1000, 1500, 1500);
+    }
+    expect(!gpuCost.ready(),
+           "CPU decoder output alone must not qualify as GPU completion history");
+    for (size_t i = 0; i < D::RecentDuration::kMinimumSamples; ++i) {
+        gpuCost.observeGpuCompletion(1000, 1500, 5000);
+    }
+    expect(gpuCost.ready() && gpuCost.percentileUs() == 4000,
+           "observed GPU completion must qualify the decode protection cost");
+    for (size_t i = 0; i < D::RecentDuration::kWindow; ++i) {
+        gpuCost.observeGpuCompletion(1000, 1500, 1500);
+        gpuCost.observeGpuCompletion(1000, 1500, 1400);
+    }
+    expect(gpuCost.percentileUs() == 4000,
+           "already-ready or invalid samples must not replace GPU cost with CPU submit cost");
+
+    D::RecentDuration synchronousCost;
+    for (size_t i = 0; i < D::RecentDuration::kMinimumSamples; ++i) {
+        synchronousCost.observeGpuCompletion(1000, 5000, 5000, true);
+    }
+    expect(synchronousCost.ready() && synchronousCost.percentileUs() == 4000,
+           "synchronous readback output is valid completion evidence");
+
+    // Decode hold around the next Present: wait for the Present call, never
+    // past the frame's own deadline or the safety bound.
+    D::publishPresentWindow(nowUs - 500, nowUs + 1500);
+    const uint64_t window = D::g_PresentWindow.load();
+    const uint64_t roomy = D::pack(10, nowUs + 8000);
+    const uint64_t tight = D::pack(10, nowUs + 1000);
+    const auto held = D::decodeHold(window, roomy, 10, nowUs);
+    expect(held.window == window && held.limitUs == nowUs + D::kMaximumDecodeHoldUs,
+           "a decode inside the Present window must wait for the Present call");
+    expect(!D::decodeHoldReleased(held, nowUs + 1000),
+           "the hold must continue while the Present window is open");
+    D::clearPresentWindow();
+    expect(D::decodeHoldReleased(held, nowUs + 1000),
+           "the Present call returning must release the hold at once");
+    D::publishPresentWindow(nowUs + 7000, nowUs + 9500);
+    expect(D::decodeHoldReleased(held, nowUs + 1000),
+           "the next frame's window must not extend an earlier hold");
+    D::publishPresentWindow(nowUs - 500, nowUs + 1500);
+    expect(D::decodeHoldReleased(D::decodeHold(D::g_PresentWindow.load(), D::pack(10, nowUs + 3000), 10, nowUs),
+                                 nowUs + 3000),
+           "a hold must end at the frame's own deadline");
+    D::clearPresentWindow();
+    expect(D::decodeHold(window, tight, 10, nowUs).window == 0,
+           "a hold must never be taken when the expected close misses the frame's deadline");
+    expect(D::decodeHold(window, 0, 10, nowUs).window == 0,
+           "without a known slot the decode must not be held");
+    expect(D::decodeHold(window, roomy, 10, nowUs + 1600).window == 0 &&
+               D::decodeHold(window, roomy, 10, nowUs - 600).window == 0,
+           "a decode outside the window must go at once");
+    expect(D::decodeHold(0, roomy, 10, nowUs).window == 0,
+           "no published window means no hold");
+
+    // The hold budget must leave room for preparation, not only decode:
+    // a roomy reassembly deadline does not authorize a hold.
+    D::publishPresentWindow(nowUs - 500, nowUs + 1500);
+    D::publish(10, nowUs + 8000);
+    D::publishHold(10, nowUs + 1000);
+    expect(D::decodeHold(10, nowUs).window == 0,
+           "a hold must use the decode-and-preparation bound, not the reassembly deadline");
+    D::publishHold(10, nowUs + 8000);
+    expect(D::decodeHold(10, nowUs).window != 0,
+           "a hold within the decode-and-preparation bound is allowed");
+    D::clear();
+    expect(D::decodeHold(10, nowUs).window == 0,
+           "clearing the deadlines also clears the hold bound");
+    D::clearPresentWindow();
+}
+
+template<class Test>
+void runNamed(const char* name, Test test)
+{
+    std::fprintf(stderr, "RUN: %s\n", name);
+    std::fflush(stderr);
+    test();
+    std::fprintf(stderr, "DONE: %s\n", name);
+    std::fflush(stderr);
+}
+
 int main()
 {
+    runNamed("testReceiveDeadlineMath()", [&] { testReceiveDeadlineMath(); });
     Vrr13::ReadinessWindow averageWindow;
     averageWindow.record(1000000, 500, false);
     averageWindow.record(1001000, 1500, false);
@@ -2604,53 +4173,69 @@ int main()
         "the mean-miss score must fall only when the average exceeds one millisecond");
     expect(Vrr13::ReadinessWindow::meanMissScore(averageWindow.snapshot(32000000)) == 100.0,
         "expired misses must not depress the current mean-miss score");
-    testTraceQueueConcurrency();
-    testReadinessWindow();
+    runNamed("testTraceQueueConcurrency()", [&] { testTraceQueueConcurrency(); });
+    runNamed("testReadinessWindow()", [&] { testReadinessWindow(); });
     SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_TIMER) != 0) {
         std::fprintf(stderr, "FAIL: SDL_Init: %s\n", SDL_GetError());
         return 1;
     }
 
-    testPreparedFramesOverlapAndTrace();
-    testSlowPreparedFramesKeepPresenting();
-    testPreparedFrameCancellationAndBound();
-    testPreparedFrameSuspendAndFallback();
-    testCapabilityRejection();
-    testPresentationRequestSelectedBeforePreparation();
-    testEmptyQueueDoesNotRepeatFrames();
-    testQueueCapacityAndDrops(1, VrrMaximumQueuedFrames);
-    testQueueCapacityAndDrops(2, VrrMaximumQueuedFrames);
-    testQueueCapacityAndDrops(0, VrrLargestQueuedFrames);
-    testLatePreparedFramePresentsImmediately();
-    testQueuedStaleFrameYieldsToFreshSuccessor();
-    testExpiredQueueSkipsBlockingDecode();
-    testSinglePeriodQueueDelayPreservesFluidity();
-    testLatencyFixDropBoundaries();
-    testLatencyFixQueuedRecovery();
-    testLatencyPresetsQueuedRecovery();
-    testDecodeWaitDoesNotExpireReadyFrame();
-    testRepeatedDecodeContentionKeepsPresenting();
-    testFirstFrameDecodeReadinessTrace();
-    testTelemetrySnapshotsRemainCumulative();
-    testSuspendDiscardAndFreshFrame();
-    testCancelledPreparedFenceTrace();
-    testDeferredSurfaceLifetime();
-    testReusableSurfaceReleasedWithoutSuccessor();
-    testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly();
-    testCancelledPresentationCountsAsDroppedOutput();
-    testPresentCallSpacingSetsDisplayFloor();
-    testBlockingPresentUsesWorkerCallBoundary();
-    testSubmissionErrorCapturesPresentOverhead();
-    testFailedPreparationCancellationHonorsDisplayFloor();
-    testSuspendedPreparedCancellationHonorsDisplayFloor();
-    testImmutablePresentationContract();
-    testTraceCapturesEveryDeliveredFrame();
-    testSmoothnessTraceCapturesReadinessPolicy();
-    testFailedCancellationNativeEvidenceIsTraced();
-    testReconnectPreservesCompletedTraces();
-    testDeepTraceRequestsNativeObservationsWithoutChangingMode();
-    testTraceCapturesAllowTearingWithoutChangingController();
+    if(qEnvironmentVariable("MOONLIGHT_VRR_TEST_TRAJECTORY_RESERVATION_ONLY")=="1") {
+        testTrajectoryReadySuccessorReservation();SDL_Quit();return failures?1:0;
+    }
+    runNamed("testPreparedFramesOverlapAndTrace()", [&] { testPreparedFramesOverlapAndTrace(); });
+    runNamed("testSlowPreparedFramesKeepPresenting()", [&] { testSlowPreparedFramesKeepPresenting(); });
+    runNamed("testPreparedFrameCancellationAndBound()", [&] { testPreparedFrameCancellationAndBound(); });
+    runNamed("testPreparedFrameSuspendAndFallback()", [&] { testPreparedFrameSuspendAndFallback(); });
+    runNamed("testCapabilityRejection()", [&] { testCapabilityRejection(); });
+    runNamed("testPresentationRequestSelectedBeforePreparation()", [&] { testPresentationRequestSelectedBeforePreparation(); });
+    runNamed("testEmptyQueueDoesNotRepeatFrames()", [&] { testEmptyQueueDoesNotRepeatFrames(); });
+    // Every profile waits in the same queue
+    runNamed("testQueueCapacityAndDrops(1, VrrLargestQueuedFrames)", [&] { testQueueCapacityAndDrops(1, VrrLargestQueuedFrames); });
+    runNamed("testQueueCapacityAndDrops(2, VrrLargestQueuedFrames)", [&] { testQueueCapacityAndDrops(2, VrrLargestQueuedFrames); });
+    runNamed("testQueueCapacityAndDrops(0, VrrLargestQueuedFrames)", [&] { testQueueCapacityAndDrops(0, VrrLargestQueuedFrames); });
+    runNamed("testAdmissionWaitInterruption()", [&] { testAdmissionWaitInterruption(); });
+    runNamed("testLatePreparedFramePresentsImmediately()", [&] { testLatePreparedFramePresentsImmediately(); });
+    runNamed("testQueuedStaleFrameYieldsToFreshSuccessor()", [&] { testQueuedStaleFrameYieldsToFreshSuccessor(); });
+    runNamed("testExpiredQueueSkipsBlockingDecode()", [&] { testExpiredQueueSkipsBlockingDecode(); });
+    runNamed("testSinglePeriodQueueDelayPreservesFluidity()", [&] { testSinglePeriodQueueDelayPreservesFluidity(); });
+    runNamed("testLatencyFixDropBoundaries()", [&] { testLatencyFixDropBoundaries(); });
+    runNamed("testLatencyFixQueuedRecovery()", [&] { testLatencyFixQueuedRecovery(); });
+    runNamed("testLatencyPresetsQueuedRecovery()", [&] { testLatencyPresetsQueuedRecovery(); });
+    runNamed("testDecodeWaitDoesNotExpireReadyFrame()", [&] { testDecodeWaitDoesNotExpireReadyFrame(); });
+    runNamed("testRepeatedDecodeContentionKeepsPresenting()", [&] { testRepeatedDecodeContentionKeepsPresenting(); });
+    runNamed("testFirstFrameDecodeReadinessTrace()", [&] { testFirstFrameDecodeReadinessTrace(); });
+    runNamed("testShortAndAlreadyCompleteDecodeReadiness()", [&] { testShortAndAlreadyCompleteDecodeReadiness(); });
+    runNamed("testNativeScheduledEnqueueCadenceAndLifecycle()", [&] { testNativeScheduledEnqueueCadenceAndLifecycle(); });
+    runNamed("testTelemetrySnapshotsRemainCumulative()", [&] { testTelemetrySnapshotsRemainCumulative(); });
+    runNamed("testSuspendDiscardAndFreshFrame()", [&] { testSuspendDiscardAndFreshFrame(); });
+    runNamed("testCancelledPreparedFenceTrace()", [&] { testCancelledPreparedFenceTrace(); });
+    runNamed("testDeferredSurfaceLifetime()", [&] { testDeferredSurfaceLifetime(); });
+    runNamed("testReusableSurfaceReleasedWithoutSuccessor()", [&] { testReusableSurfaceReleasedWithoutSuccessor(); });
+    runNamed("testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly()", [&] { testDecodeBoundaryCapturedBeforeQueueAndPreparedExactly(); });
+    runNamed("testCancelledPresentationCountsAsDroppedOutput()", [&] { testCancelledPresentationCountsAsDroppedOutput(); });
+    runNamed("testPresentCallSpacingSetsDisplayFloor()", [&] { testPresentCallSpacingSetsDisplayFloor(); });
+    runNamed("testBlockingPresentUsesWorkerCallBoundary()", [&] { testBlockingPresentUsesWorkerCallBoundary(); });
+    runNamed("testSubmissionErrorCapturesPresentOverhead()", [&] { testSubmissionErrorCapturesPresentOverhead(); });
+    runNamed("testFailedPreparationCancellationHonorsDisplayFloor()", [&] { testFailedPreparationCancellationHonorsDisplayFloor(); });
+    runNamed("testSuspendedPreparedCancellationHonorsDisplayFloor()", [&] { testSuspendedPreparedCancellationHonorsDisplayFloor(); });
+    runNamed("testImmutablePresentationContract()", [&] { testImmutablePresentationContract(); });
+    runNamed("testTraceCapturesEveryDeliveredFrame()", [&] { testTraceCapturesEveryDeliveredFrame(); });
+    runNamed("testSmoothnessTraceCapturesReadinessPolicy()", [&] { testSmoothnessTraceCapturesReadinessPolicy(); });
+    runNamed("testFailedCancellationNativeEvidenceIsTraced()", [&] { testFailedCancellationNativeEvidenceIsTraced(); });
+    runNamed("testMetalPresentationFeedback()", [&] { testMetalPresentationFeedback(); });
+    runNamed("testD3D11ReadinessBeforeTarget()", [&] { testD3D11ReadinessBeforeTarget(); });
+    runNamed("testSynchronizedCompositionFeedback()", [&] { testSynchronizedCompositionFeedback(); });
+    runNamed("testDxgiConfirmedRefreshFeedback()", [&] { testDxgiConfirmedRefreshFeedback(); });
+    runNamed("testDxgiGuardWithoutAlignmentTrace()", [&] { testDxgiGuardWithoutAlignmentTrace(); });
+    runNamed("testMetalFailedPreparationFeedback()", [&] { testMetalFailedPreparationFeedback(); });
+    runNamed("testReconnectPreservesCompletedTraces()", [&] { testReconnectPreservesCompletedTraces(); });
+    runNamed("testDeepTraceRequestsNativeObservationsWithoutChangingMode()", [&] { testDeepTraceRequestsNativeObservationsWithoutChangingMode(); });
+    if(qEnvironmentVariable("MOONLIGHT_VRR_TEST_SKIP_RESERVATION")!="1")
+        testTrajectoryReadySuccessorReservation();
+    runNamed("testExperimentalInputPercentileActivationTrace()", [&] { testExperimentalInputPercentileActivationTrace(); });
+    runNamed("testTraceCapturesAllowTearingWithoutChangingController()", [&] { testTraceCapturesAllowTearingWithoutChangingController(); });
 
     exportWarmHistoryReplayFixture();
     SDL_Quit();
