@@ -1559,7 +1559,7 @@ binds the planes directly with the triplanar shader, a bitness scale of 1 and,
 for R16 planes, CSC constants computed at 16 bits (`getFrameBitsPerChannel()`),
 since the samples are full-range 16-bit as on the Vulkan path. An unsupported GPU (Intel/AMD Macs) or initialization failure falls through to the
 MoltenVK pool path (`PyroWaveMetalPool`, the default). The Metal backend is opt-in after the Nonary merge, rejects LZ4-compressed detail groups, and reports no decode completion to the VRR worker. Both decoders implement `IPyroWaveFrameDecoder` and apply the
-same framing, partial-frame and readiness rules. Patch 0005 carries the 0003
+same framing, partial-frame and readiness rules. Patch 0012 carries the 0003
 short-block fix into the Metal parser. Verified on an M3 Pro by
 `tests/pyrowave/metal.pro` (Metal encoder; Metal decoder against the MoltenVK
 Vulkan decoder within 2 LSB at 720p-3024x1890, 4:2:0/4:4:4, 8/10-bit; single
