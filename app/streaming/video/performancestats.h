@@ -7,17 +7,15 @@
 #include <string>
 
 // Presentation only: these values never become controller feedback.
-// The normal overlay keeps Moonlight's original stats and appends this short
-// VRR summary; the full breakdown remains in the session log.
+// Measured client timing is a total with included components. Scheduling
+// budgets are separate control values, never additive latency measurements.
 namespace PerformanceStats {
 struct Snapshot {
     bool vrr = false, adaptive = false, atLimit = false;
     uint64_t bufferUs = 0;
-    // Scheduled beyond the input buffer by cadence smoothing and late-frame
-    // recovery. Show it and the total separately from the input buffer so the
-    // value labeled "VRR buffer" matches the timing graph's Buffer line.
-    // Label the combined positive correction "extra delay": display-spacing
-    // and recovery holds can exceed the cadence smoother's tolerance budget.
+    // Positive scheduling correction beyond the input budget, from smoothing,
+    // recovery and display spacing. Both values are budgets, not measured
+    // residence times; the buffer still matches the graph's Buffer line.
     uint64_t smoothingUs = 0;
     uint64_t targetPpm = 0, toleranceUs = 0;
     uint64_t nowUs = 0;
@@ -33,6 +31,26 @@ struct Snapshot {
 inline bool fresh(uint64_t atUs, uint64_t nowUs)
 {
     return atUs && nowUs >= atUs && nowUs - atUs <= 1000000;
+}
+
+// Counters share the rendered-frame population and window. The residual is
+// the bounded GPU decode synchronization removed from queue/render accounting;
+// it is not inferred from the latest buffer budget or from dropped frames.
+inline std::string formatClientTiming(uint64_t totalUs, uint64_t queueUs,
+                                      uint64_t renderUs, uint64_t frames)
+{
+    if (!frames) return "";
+    // Never turn inconsistent/reset counters into an unsigned latency spike.
+    if (queueUs > totalUs || renderUs > totalUs - queueUs)
+        return "Average post-output client time: N/A (timing counters unavailable)\n";
+    const uint64_t decodeWaitUs = totalUs - queueUs - renderUs;
+    const double divisor = frames * 1000.0;
+    char text[320];
+    std::snprintf(text, sizeof(text),
+        "Average post-output client time: %.2f ms (to Present return)\n"
+        "  Includes queue/pacing %.2f ms | GPU decode wait %.2f ms | CPU render/submit %.2f ms\n",
+        totalUs / divisor, queueUs / divisor, decodeWaitUs / divisor, renderUs / divisor);
+    return text;
 }
 
 inline std::string formatVrr(const Snapshot& s)
@@ -60,16 +78,25 @@ inline std::string formatVrr(const Snapshot& s)
         }
         else std::snprintf(coverage, sizeof(coverage), "coverage N/A / %.2f%% target", target);
         if (s.input.reportingWindowUs) {
-            char recent[32], history[32];
+            char recent[32], history[32], excluded[64] = "";
+            // Inputs over the buffer limit or without valid timing are not
+            // scored; show them so overload cannot read as clean coverage.
+            if (s.input.reportingIneligible)
+                std::snprintf(excluded, sizeof(excluded), " | %llu excluded (over limit/unmeasured)",
+                    static_cast<unsigned long long>(s.input.reportingIneligible));
+            else if (s.input.lostCauseRetained)
+                std::snprintf(excluded, sizeof(excluded), " | %s%llu lost-cause (kept 10 s)",
+                    s.input.lostCauseActive ? "now " : "",
+                    static_cast<unsigned long long>(s.input.lostCauseRetained));
             const auto percent=[](char* out, uint64_t count, uint64_t misses) {
                 if (count) std::snprintf(out, 32, "%.2f%%", 100.0 * double(count-std::min(count,misses))/double(count));
                 else std::snprintf(out, 32, "N/A");
             };
             percent(recent, s.input.reportingEligible, s.input.reportingMissed);
             percent(history, s.input.recentEligible, s.input.recentMissed);
-            std::snprintf(coverage, sizeof(coverage), "coverage (%llus) %s / %.2f%% | %llus %s",
+            std::snprintf(coverage, sizeof(coverage), "coverage (%llus) %s / %.2f%% | %llus %s%s",
                 static_cast<unsigned long long>(s.input.reportingWindowUs/1000000), recent, target,
-                static_cast<unsigned long long>(s.input.windowUs/1000000), history);
+                static_cast<unsigned long long>(s.input.windowUs/1000000), history, excluded);
         }
     }
     else if (s.clientTimingValid)
@@ -86,8 +113,8 @@ inline std::string formatVrr(const Snapshot& s)
     else std::snprintf(present, sizeof(present), "N/A (no recent display feedback)");
 
     std::snprintf(text, sizeof(text),
-        "VRR buffer: %s | %s\n"
-        "Extra delay: %.2f ms (smoothing/recovery) | Planned total: %.2f ms\n"
+        "VRR buffer budget: %s | %s\n"
+        "Retiming budget: %.2f ms | Combined budget: %.2f ms (not added to measured times)\n"
         "Present timing issues (30s): %s\n",
         buffer, coverage, s.smoothingUs / 1000.0, totalMs, present);
     return text;

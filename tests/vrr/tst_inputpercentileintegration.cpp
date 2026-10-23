@@ -359,6 +359,449 @@ void testStableTargetKeepsPreventableMissScoring() {
     observe(up,1,9000);up.transitionFrom(1000);
     check(up.stats().currentUs==6000,"larger learned layers still restore their existing protection immediately");
 }
+// Revision 2 restores progress without turning a clean raw-input plateau into
+// an unrestricted release ramp. Existing revision-1 expectations stay above.
+void testFeedbackValidatedStableRelease() {
+    const auto observe=[](InputPercentileBuffer& p,uint64_t f,int64_t required,
+                          bool hitch=false,bool valid=true,uint64_t room=1000) {
+        p.observe(f,1000000+f*10000,2000000+f*10000,required,valid,
+            1000,12000,995000,120000000,1000,250,0,500,room,0,hitch,10);
+    };
+    InputPercentileBuffer trial;trial.reset(8621);trial.setStableAdaptation(2);
+    for(uint64_t f=1;f<=200;++f) observe(trial,f,11000);
+    check(trial.stats().currentUs==8521 && trial.stats().missed==0,
+          "a clean raw-input plateau permits one finite 100 us trial, not a continuous drain");
+    const auto held=trial.stats().currentUs;
+    for(uint64_t f=201;f<=500;++f) observe(trial,f,11000,false,false);
+    check(trial.stats().currentUs==held && trial.stats().eligible==200,
+          "invalid outcomes cannot fund the tail support needed for another trial");
+    for(uint64_t f=501;f<=800;++f) observe(trial,f,11000);
+    check(trial.stats().currentUs<held && trial.stats().currentUs>=held-200,
+          "fresh feedback at the lower buffer permits another bounded trial");
+    const auto before=trial.stats();
+    observe(trial,801,11000,true);
+    check(trial.stats().missed==before.missed+1 && trial.stats().currentUs>=before.currentUs &&
+          trial.stats().currentUs<=before.currentUs+10,
+          "a fresh preventable hitch cancels release and retains normal bounded growth");
+    check(trial.stats().probabilityPpm==995000 && trial.stats().windowUs==120000000,
+          "feedback trials preserve the selected smoothness target and full learning window");
+    InputPercentileBuffer measured,recorded,noRoom;
+    measured.reset(8621);measured.setStableAdaptation(2);
+    recorded.reset(8621);recorded.setStableAdaptation(1);
+    noRoom.reset(8621);noRoom.setStableAdaptation(2);
+    uint64_t previous=8621;
+    for(uint64_t f=1;f<=250;++f) {
+        observe(measured,f,1500);observe(recorded,f,1500);observe(noRoom,f,9500,false,true,0);
+        const auto now=measured.stats().currentUs;
+        check(now<=previous && previous-now<=50,
+              "measured surplus obeys the normal 0.5-percent-per-interval recovery bound");
+        previous=now;
+        if(f==100) {
+            const auto saved=now;
+            auto delayed=measured;delayed.advance(2010000);delayed.advance(2020000);
+            check(saved-delayed.stats().currentUs<=50,
+                  "repeated decisions cannot spend the same interval allowance twice");
+        }
+    }
+    check(measured.stats().currentUs==recorded.stats().currentUs && recorded.stats().currentUs>7900,
+          "ordinary measured-surplus release remains identical to the configured 250 us/s historical law");
+    check(noRoom.stats().currentUs==8621,
+          "a plateau without physical recovery room cannot authorize speculative release");
+    // An interrupted lower-layer visit must save its own learned destination.
+    InputPercentileBuffer lower;lower.reset(1000);lower.setStableAdaptation(2);
+    // Support the selected tail with this layer's own low requirements first.
+    observe(lower,1,9500);
+    for(uint64_t f=2;f<=201;++f) observe(lower,f,1500);
+    lower.transitionFrom(8621);
+    for(uint64_t f=202;f<=301;++f) observe(lower,f,1500);
+    check(lower.stats().currentUs==8371,
+          "a lower layer retains the configured normal drain before storing its own learned destination");
+    lower.prepareForLayerStorage();
+    check(lower.stats().currentUs==1000 && lower.stats().targetUs==1000,
+          "a layer cache cannot turn inherited excess into a permanent learned floor");
+}
+
+
+// Revision 3 releases continuously using elapsed time, not a frame-count wait.
+void testContinuousStableRelease() {
+    for (const uint64_t revision : {3, 4})
+    for (const uint64_t fps : {20, 30, 116}) {
+        for (const uint64_t probability : {990000, 995000, 999500}) {
+            InputPercentileBuffer buffer;
+            buffer.reset(8621);
+            buffer.setStableAdaptation(revision);
+            const auto observe = [&](uint64_t f, bool valid = true, bool miss = false,
+                                     uint64_t room = 1000) {
+                const auto at = 1000000 + f * 1000000 / fps;
+                buffer.observe(f, at, at + 1000000, 11000, valid,
+                    1000, 12000, probability, 120000000, 1000, 250,
+                    0, 500, room, 0, miss, 10);
+            };
+            for (uint64_t f = 1; f <= fps * 2; ++f) observe(f);
+            const auto start = buffer.stats();
+            for (uint64_t f = fps * 2 + 1; f <= fps * 6; ++f) observe(f);
+            const auto end = buffer.stats();
+            const auto released = start.currentUs - end.currentUs;
+            std::fprintf(stderr, "continuous release %llu FPS p%llu: %llu us / 4s\n",
+                (unsigned long long)fps, (unsigned long long)probability,
+                (unsigned long long)released);
+            check(released >= 950 && released <= 1000,
+                "clean plateau drains at the configured time-based rate without tail-sample pauses");
+            check(end.missed == 0 && end.probabilityPpm == probability && end.windowUs == 120000000,
+                "continuous release preserves actual miss scoring and selected history");
+            const auto beforeInvalid = end.currentUs;
+            for (uint64_t f = fps * 6 + 1; f <= fps * 7; ++f) observe(f, false);
+            check(buffer.stats().currentUs == beforeInvalid,
+                "invalid observations cannot authorize continuous plateau release");
+            for (uint64_t f = fps * 7 + 1; f <= fps * 8; ++f) observe(f, true, false, 0);
+            check(buffer.stats().currentUs == beforeInvalid,
+                "no physical recovery room cannot authorize plateau release");
+            observe(fps * 8 + 1, true, true);
+            check(buffer.stats().currentUs >= beforeInvalid && buffer.stats().missed == 1,
+                "fresh qualifying misses still stop plateau release");
+        }
+    }
+}
+
+
+void testSelectedWindowReleaseGate() {
+    for (const uint64_t fps : {20, 116}) {
+        for (const int mode : {0, 1, 2}) {
+            Vrr13::InputCoverageHistory history;
+            constexpr uint64_t window = 120000000, probability = 995000;
+            // One percent historical misses, all older than the short report.
+            for (uint64_t f = 1; f <= 2000; ++f)
+                history.observe(1000000 + f * 10000, window, true, false, f <= 20);
+            InputPercentileBuffer buffer;
+            buffer.reset(mode == 2 ? 4000 : 8621);
+            buffer.setStableAdaptation(4);
+            buffer.endLearning();
+            uint64_t frame = 0;
+            const int64_t required = mode == 0 ? 11000 : 2000;
+            const auto observe = [&](uint64_t at) {
+                history.advance(at, window);
+                const auto before = buffer.stats();
+                buffer.observe(++frame, at, at + 1000000, required, true,
+                    1000, 12000, probability, window, 1000, 250,
+                    0, 500, 1000, 0, false, 10, !history.belowGoal(probability));
+                const auto after = buffer.stats();
+                history.observe(at, window, after.eligible > before.eligible,
+                    after.absorbed > before.absorbed, after.missed > before.missed);
+            };
+            observe(22000000);
+            if (mode == 2) buffer.transitionFrom(8621);
+            const auto held = buffer.stats().currentUs;
+            for (uint64_t f = 1; f <= fps * 4; ++f) {
+                const uint64_t at = 22000000 + f * 1000000 / fps;
+                observe(at);
+                buffer.advance(at + 1, 1000, 12000, probability, window,
+                    1000, 250, 0, 500, 1000, 0, 10, !history.belowGoal(probability));
+                check(buffer.stats().currentUs == held,
+                    "below selected session goal blocks observation and decision release, including lower demand and layers");
+            }
+            auto coverage = buffer.stats();
+            history.report(coverage, true);
+            check(coverage.reportingEligible && coverage.reportingMissed == 0 &&
+                  history.belowGoal(probability),
+                "a perfect ten-second report cannot override a failing 120-second goal");
+            check(buffer.stats().recentMissed == 0 && buffer.stats().recentReleaseMisses == 0,
+                "clean active-layer and one-second feedback cannot erase session misses");
+            // Misses expire by wall time. Resume with a fresh pair, without
+            // waiting for 200 observations or banking the held time as credit.
+            observe(122000000);
+            const auto resumed = buffer.stats().currentUs;
+            check(!history.belowGoal(probability) && held - resumed <= 25,
+                "expired session misses reopen release without accumulated hold credit");
+            for (uint64_t f = 1; f <= fps; ++f)
+                observe(122000000 + f * 1000000 / fps);
+            const auto released = resumed - buffer.stats().currentUs;
+            // After the long gap, plateau probes still need eight fresh
+            // eligible samples. Even at 20 FPS they resume inside this second.
+            check(released >= 125 && released <= 250,
+                "goal recovery resumes bounded continuous release within one second, without 200 frames");
+        }
+    }
+    Vrr13::InputCoverageHistory boundary;
+    check(!boundary.belowGoal(995000), "empty session history preserves ordinary unknown-history expiry");
+    for (uint64_t f = 1; f <= 199; ++f)
+        boundary.observe(f * 10000, 120000000, true, false, f == 1);
+    check(boundary.belowGoal(995000), "one miss in 199 remains below 99.5 percent");
+    boundary.observe(2000000, 120000000, false, false, false);
+    check(boundary.belowGoal(995000), "invalid input cannot supply clean goal credit");
+    boundary.observe(2010000, 120000000, true, false, false);
+    check(!boundary.belowGoal(995000), "exactly 99.5 percent authorizes release without an extra wait");
+}
+
+
+void testRequiredBufferEstimateMath() {
+    check(Vrr13::InputBufferEstimate::calibratedProbability(995000,10000,50)==995000 &&
+          Vrr13::InputBufferEstimate::calibratedProbability(995000,10000,0)==995000,
+        "meeting the actual goal keeps the user's modeled miss allowance rather than demanding zero hitches");
+    check(Vrr13::InputBufferEstimate::calibratedProbability(995000,10000,100)==997500 &&
+          Vrr13::InputBufferEstimate::calibratedProbability(995000,10000,200)==998750,
+        "full-window goal deficits tighten modeled allowance proportionally without a hard hold");
+    struct Sample { uint64_t at,slot; int64_t required; uint64_t epoch;
+                    bool seed; uint64_t recoveryUs; bool missed = false; };
+    std::vector<Sample> samples;
+    for (uint64_t f=0;f<180;++f) {
+        const int64_t q = f<25 ? 3500 : f%17==0 ? 9000 : f%7==0 ? 4800 : 1000;
+        samples.push_back({1000000+f*10000,2000000+f*10000,q,
+                          f/60,false,f%3==0?150u:500u});
+    }
+    for (const uint64_t tolerance : {250,500,2000}) {
+        for (const uint64_t probability : {900000,990000,995000,999900}) {
+            Vrr13::InputBufferEstimate estimate;
+            estimate.evaluate(samples,probability,tolerance);
+            for (const int64_t projection : {-1200,0,1700}) {
+                for (uint64_t b=0;b<=12000;b+=137) {
+                    uint64_t misses=0,previousLate=0,epoch=UINT64_MAX;
+                    for (const auto& s:samples) {
+                        const uint64_t ready=s.required>projection?uint64_t(s.required-projection):0;
+                        const uint64_t inputLate=ready>b?ready-b:0;
+                        if (s.epoch!=epoch) {previousLate=inputLate;epoch=s.epoch;continue;}
+                        const uint64_t recovered=previousLate-std::min(previousLate,s.recoveryUs);
+                        const uint64_t late=std::max(inputLate,recovered);
+                        misses+=inputLate>tolerance && late>previousLate && late-previousLate>tolerance;
+                        previousLate=late;
+                    }
+                    check(estimate.missesAt(b,samples.back().at,300000000,projection,0,tolerance)==misses,
+                        "candidate threshold math matches an independent constant-buffer cadence simulation");
+                }
+                const auto target=estimate.requiredUs(projection,0,tolerance);
+                const auto allowed=estimate.samples()*(1000000-probability)/1000000;
+                check(estimate.missesAt(target,samples.back().at,300000000,projection,0,tolerance)<=allowed,
+                    "selected percentile covers the configured share of modeled intervals");
+                if(target) check(estimate.missesAt(target-1,samples.back().at,300000000,projection,0,tolerance)>allowed,
+                    "required-buffer estimate is the smallest value satisfying the selected goal");
+            }
+        }
+    }
+    std::vector<Sample> constant;
+    for(uint64_t f=0;f<500;++f)constant.push_back({1000000+f*10000,2000000+f*10000,9000,1,false,200});
+    Vrr13::InputBufferEstimate estimate;estimate.evaluate(constant,995000,500);
+    check(estimate.requiredUs(0,0,500)==0 && estimate.missesAt(0,6000000,120000000,0,0,500)==0,
+        "constant late input with constant cadence cannot manufacture recurring buffer demand");
+    for(size_t i=25;i<constant.size();i+=30)constant[i].missed=true;
+    estimate.evaluate(constant,995000,500);
+    check(estimate.requiredUs(0,0,500)==8500 &&
+          estimate.missesAt(1000,6000000,120000000,0,0,500)>2,
+        "proven readiness-attributed hitches override modeled recovery that would otherwise hide demand");
+    for(auto& s:constant)s.seed=true;
+    estimate.evaluate(constant,995000,500);
+    check(estimate.samples()==0,"copied layer seeds are not fresh modeled clean outcomes");
+}
+
+void testRollingEstimateSettingsAndConvergence() {
+    for(const uint64_t seconds:{10,30,60,120,300}) {
+        InputPercentileBuffer buffer;buffer.reset(9000);buffer.setStableAdaptation(5);
+        for(uint64_t f=1;f<=200;++f) {
+            const auto at=1000000+f*10000;
+            buffer.observe(f,at,at+1000000,f%10==0?8000:0,true,1000,12000,
+                995000,seconds*1000000,1000,250,0,500,1000,0,false,10,false);
+        }
+        const auto before=buffer.stats();
+        check(before.windowUs==seconds*1000000 && before.probabilityPpm==995000 && before.targetUs==7500,
+            "rolling demand uses the user's history seconds and goal, not a fixed 120-second window");
+        check(before.currentUs<9000 && before.currentUs>7500,
+            "gradual convergence releases toward the estimate even when the old session hard-hold flag is false");
+        buffer.advance(3100000,1000,12000,995000,seconds*1000000,
+            1000,250,3000,500,1000,100000,10,false);
+        check(buffer.stats().targetUs==7500,
+            "later clock/budget projection cannot erase the protection duration retained frames needed");
+        buffer.advance(15000000,1000,12000,995000,seconds*1000000,1000,250,0,500,1000,0,10,false);
+        check(seconds==10?buffer.stats().targetUs==1000:buffer.stats().targetUs==7500,
+            "wall-clock expiry respects each selected history duration");
+        buffer.advance((seconds+4)*1000000,1000,12000,995000,seconds*1000000,1000,250,0,500,1000,0,10,false);
+        check(buffer.stats().expiredUnknown && buffer.stats().targetUs==1000,
+            "expired delivery evidence retires at the configured horizon");
+    }
+    {
+        InputPercentileBuffer layer;layer.reset(5000);layer.setStableAdaptation(5);
+        for(uint64_t f=1;f<=200;++f) {
+            const uint64_t at=1000000+f*10000;
+            layer.observe(f,at,at+1000000,f%10==0?8000:0,true,
+                1000,12000,995000,120000000,1000,250,0,500,1000,0,false,10);
+            if(f==1)layer.transitionFrom(9000);
+        }
+        const auto destination=layer.stats().targetUs;
+        check(layer.stats().currentUs>destination && destination==7500,
+            "layer regression has updated rolling demand while inherited protection is draining");
+        layer.prepareForLayerStorage();
+        check(layer.stats().currentUs==destination,
+            "saved layer retains its updated computed destination rather than an obsolete floor or inherited excess");
+    }
+    for(const uint64_t fps:{20,30,116}) {
+        InputPercentileBuffer buffer;buffer.reset(9000);buffer.setStableAdaptation(5);
+        uint64_t firstSecond=0,atSix=0;
+        for(uint64_t f=1;f<=fps*7;++f) {
+            const auto at=1000000+f*1000000/fps;
+            buffer.observe(f,at,at+1000000,f%10==0?8000:0,true,1000,12000,
+                995000,120000000,1000,250,0,500,1000,0,false,10,false);
+            if(f==fps)firstSecond=9000-buffer.stats().currentUs;
+            if(f==fps*6)atSix=buffer.stats().currentUs;
+        }
+        const auto end=buffer.stats();
+        check(firstSecond>150 && firstSecond<=250,
+            "convergence starts within one second at low FPS without waiting for 200 frames");
+        check(atSix-end.currentUs>0 && atSix-end.currentUs<firstSecond && end.currentUs>7500,
+            "movement tapers near the rolling estimate instead of draining at a fixed speed or overshooting");
+    }
+}
+
+// Revision 6 must obey measured hitch coverage even when raw readiness
+// repeatedly asks for more delay (for example, late GPU collection).
+void testHitchCoverageOwnsAdaptation() {
+    for (const uint64_t fps : {20, 116}) {
+        InputPercentileBuffer buffer; buffer.reset(9000); buffer.setStableAdaptation(6);
+        buffer.endLearning();
+        uint64_t maximum = 9000;
+        for (uint64_t f = 1; f <= fps * 30; ++f) {
+            const uint64_t at = 1000000 + f * 1000000 / fps;
+            const bool hitch = f > fps * 10 && f % 333 == 0;
+            const auto missesBefore = buffer.stats().missed;
+            buffer.observe(f, at, at + 1000000, f % 2 ? 11000 : 8000, true,
+                1000, 14000, 995000, 120000000, 1000, 250, 0, 1000, 2000,
+                0, hitch, 11);
+            if (buffer.stats().missed > missesBefore)
+                check(buffer.stats().recentReleaseMisses > 0,
+                    "hitch-governed release diagnostics retain actual allowed hitches");
+            maximum = std::max(maximum, buffer.stats().currentUs);
+        }
+        const auto stats = buffer.stats();
+        check(stats.recentMissed * 1000000 < stats.recentEligible * 5000,
+            "fixture stays above the actual hitch-coverage goal with occasional allowed hitches");
+        check(maximum <= 9000,
+            "meeting hitch coverage forbids growth from raw readiness or an allowed hitch");
+        check(stats.currentUs < 7000,
+            "surplus hitch coverage continuously releases protection despite a high raw estimate");
+        const auto before = stats.currentUs;
+        for (uint64_t f = fps * 30 + 1; f <= fps * 35; ++f) {
+            const auto at = 1000000 + f * 1000000 / fps;
+            buffer.observe(f, at, at + 1000000, 11000, false,
+                1000, 14000, 995000, 120000000, 1000, 250, 0, 1000, 2000,
+                0, false, 11);
+        }
+        check(buffer.stats().currentUs == before,
+            "invalid input cannot keep authorizing speculative hitch-based release");
+    }
+    {
+        InputPercentileBuffer layer; layer.reset(10000); layer.setStableAdaptation(6);
+        layer.setHitchCoverage(10000, 30); // 99.70%, despite any local-layer estimate.
+        layer.advance(1000000, 1000, 14000, 995000, 120000000, 1000, 250,
+            0, 1000, 2000, 0, 11);
+        layer.transitionFrom(6000);
+        check(layer.stats().currentUs == 6000 && layer.stats().targetUs <= 6000,
+            "a saved larger rate layer cannot restore latency while session coverage meets the goal");
+    }
+    for (const uint64_t fps : {20, 116}) {
+        InputPercentileBuffer session; session.reset(9000); session.setStableAdaptation(6);
+        session.endLearning();
+        for (uint64_t f = 1; f <= fps * 4; ++f) {
+            const auto at = 1000000 + f * 1000000 / fps;
+            session.setHitchCoverage(10000, 30); // 99.70% across all source layers.
+            session.observe(f, at, at + 1000000, f % 2 ? 11000 : 8000, true,
+                1000, 14000, 995000, 120000000, 1000, 250, 0, 1000, 2000,
+                0, false, 11);
+        }
+        const auto current = session.stats().currentUs;
+        check(current >= 8580 && current <= 8630,
+            "99.70% session coverage against 99.50% releases continuously at about 100 us/s");
+        session.setHitchCoverage(10000, 50); // Exactly the configured goal.
+        session.advance(5020000, 1000, 14000, 995000, 120000000,
+            1000, 250, 0, 1000, 2000, 0, 11);
+        check(session.stats().currentUs == current && session.stats().targetUs == current,
+            "exact goal attainment holds protection without readiness-driven growth");
+    }
+    InputPercentileBuffer deficit; deficit.reset(1000); deficit.setStableAdaptation(6);
+    deficit.endLearning();
+    for (uint64_t f = 1; f <= 200; ++f) {
+        const auto at = 1000000 + f * 10000;
+        deficit.observe(f, at, at + 1000000, f % 2 ? 5000 : 11000, true,
+            1000, 14000, 995000, 120000000, 1000, 250, 0, 1000, 2000,
+            0, f % 2, 11);
+    }
+    check(deficit.stats().currentUs > 2000 && deficit.stats().targetUs == 4000,
+        "a hitch-coverage deficit grows only toward proven hitch demand, not harmless larger readiness");
+    deficit.setHitchCoverage(10000, 60);
+    deficit.observe(201, 3010000, 4010000, 9000, true, 1000, 14000,
+        995000, 120000000, 1000, 250, 0, 1000, 2000, 0, true, 11);
+    check(deficit.stats().targetUs == 8000,
+        "a fresh larger qualifying hitch cannot be trimmed away while the actual goal is failing");
+    InputPercentileBuffer capped; capped.reset(16000); capped.setStableAdaptation(6);
+    capped.setHitchCoverage(10000, 60);
+    capped.observe(1, 1000000, 2000000, 5000, true, 1000, 14000,
+        995000, 120000000, 1000, 250, 0, 1000, 2000, 0, false, 11);
+    check(capped.stats().targetUs == 14000,
+        "a coverage deficit cannot retain a target above the current safety cap");
+}
+
+void testRollingHitchMeanOwnsTarget() {
+    InputPercentileBuffer buffer; buffer.reset(1000); buffer.setStableAdaptation(7);
+    buffer.endLearning();
+    for (uint64_t f = 1; f <= 1000; ++f) {
+        const auto at = 1000000 + f * 10000;
+        buffer.setHitchCoverage(10000, 60); // Historical deficit, not a demand magnitude.
+        buffer.observe(f, at, at + 1000000, f % 100 ? 0 : 4000, true,
+            1000, 14000, 995000, 120000000, 1000, 250, 0, 1000, 2000,
+            0, f % 100 == 0, 11);
+    }
+    const auto count = buffer.stats().missed;
+    check(count > 0 && buffer.stats().targetUs == 4000,
+        "mean 3 ms of required hitch protection plus 1 ms tolerance targets 4 ms");
+    const auto before = buffer.stats().currentUs;
+    buffer.setHitchCoverage(10000, 60);
+    buffer.observe(1001, 11010000, 12010000, 7000, true,
+        1000, 14000, 995000, 120000000, 1000, 250, 0, 1000, 2000, 0, true, 11);
+    const auto expected = (count * 3000 + 6000 + count) / (count + 1) + 1000;
+    check(buffer.stats().targetUs == expected && buffer.stats().targetUs < 6000,
+        "a single 6 ms requirement joins the rolling average instead of replacing it");
+    check(buffer.stats().currentUs <= before + 10,
+        "a new hitch cannot jump the applied buffer to its individual requirement");
+    buffer.transitionFrom(9000);
+    buffer.takePendingRelease();
+    check(buffer.stats().currentUs == 9000 && buffer.stats().targetUs == expected,
+        "a layer change preserves applied protection and the rolling-mean destination");
+    buffer.setHitchCoverage(10000, 60);
+    buffer.observe(1002, 11020000, 12020000, 0, true,
+        1000, 14000, 995000, 120000000, 1000, 250, 0, 1000, 2000, 0, false, 11);
+    check(buffer.stats().currentUs < 9000 && buffer.stats().currentUs >= 8997,
+        "old below-goal outcomes cannot freeze release or authorize a T-per-frame jump");
+}
+
+void testSessionHitchMeanHistory() {
+    Vrr13::InputCoverageHistory history;
+    history.observe(1000000, 10000000, true, false, true, 3000);
+    history.observe(6000000, 10000000, true, false, true, 6000);
+    history.observe(7000000, 10000000, true, true, false, 900000);
+    history.observe(8000000, 10000000, false, false, true, 900000);
+    check(history.hitchRequiredSamples() == 2 && history.hitchRequiredSumUs() == 9000,
+        "only actual eligible hitch requirements enter the mean; clean and invalid inputs cannot bias it");
+    history.advance(11000000, 10000000);
+    check(history.hitchRequiredSamples() == 1 && history.hitchRequiredSumUs() == 6000,
+        "hitch requirements expire individually on the selected history clock");
+    InputPercentileBuffer buffer; buffer.reset(1000); buffer.setStableAdaptation(7);
+    buffer.setHitchCoverage(history.eligible(), history.missed());
+    buffer.setHitchEstimate(history.hitchRequiredSumUs(), history.hitchRequiredSamples());
+    buffer.observe(1, 11000000, 12000000, 0, true, 1000, 14000,
+        995000, 10000000, 1000, 250, 0, 1000, 2000, 0, false, 11);
+    check(buffer.stats().targetUs == 7000 && buffer.stats().hitchRequirementSamples == 1 &&
+          buffer.stats().hitchRequirementMeanUs == 6000,
+        "a new rate layer uses the session's real hitch mean rather than an empty local history");
+    buffer.setHitchCoverage(10000, 58);
+    buffer.setHitchEstimate(6000, 1);
+    buffer.advance(11001000, 1000, 14000, 995000, 10000000, 1000, 250, 0, 1000, 2000, 0, 11);
+    check(buffer.stats().targetUs == 7000,
+        "small coverage changes do not change the magnitude of measured buffer demand");
+    buffer.setHitchCoverage(10000, 30);
+    buffer.setHitchEstimate(6000, 1);
+    buffer.advance(11002000, 1000, 14000, 995000, 10000000, 1000, 250, 0, 1000, 2000, 0, 11);
+    check(buffer.stats().targetUs == buffer.stats().currentUs,
+        "meeting the hitch goal still refuses extra standing protection");
+    history.advance(17000000, 10000000);
+    check(history.hitchRequiredSamples() == 0 && history.hitchRequiredSumUs() == 0,
+        "expired hitch evidence leaves no residual mean or invented zero-sized hitches");
+}
+
 void testSharedExtraBufferAllowance() {
     for(const uint64_t tolerance : {250,500,2000}) {
         Vrr13::ExtraBufferSlew slew;
@@ -1050,14 +1493,14 @@ void testOrdinaryVariationKeepsLayer() {
     }
 }
 
-void testFastControllerLayerRoundTrip(uint64_t version, bool bounded=false) {
+void testFastControllerLayerRoundTrip(uint64_t version, bool bounded=false, uint64_t stableRevision=1) {
     VrrSessionConfig session;session.streamRateHz=120;session.displayRefreshHz=120;
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.experimentalBoundedCatchup=bounded;
     session.timingOptions={1000,9950,120,500};
     auto policy=vrrTimingParametersForSession(session);
     policy.latencyFixEnabled=0;
-    policy.playoutInputHitchMissesOnly=version;policy.playoutInputStableAdaptation=version>=10;
+    policy.playoutInputHitchMissesOnly=version;policy.playoutInputStableAdaptation=version>=10?stableRevision:0;
     policy.playoutDelayStartSeedUs=4000;policy.playoutDelayMinimumUs=1000;
     policy.playoutDelayMaximumUs=12000;
     policy.playoutDelayMaximumPeriodPerMille=policy.playoutDelayCapSourcePeriodPerMille=0;
@@ -1117,6 +1560,9 @@ void testRateBaselineStepIsNotClockDrift() {
         session.experimentalBoundedCatchup=true;
         session.experimentalInputPercentilePpm=995000;session.timingOptions={1000,9950,120,500};
         auto policy=vrrTimingParametersForSession(session);
+        // Compare the historical producer-clock policies explicitly. New live
+        // sessions use the independently tested packet-receive clock (mode 4).
+        policy.playoutInputClockRelativeHistory=3;
         policy.playoutInputHitchMissesOnly=version;policy.playoutInputStableAdaptation=version>=10;policy.latencyFixEnabled=0;
         policy.playoutDelayStartSeedUs=1000;
         VrrTimingController c(session,true,policy);
@@ -1210,11 +1656,22 @@ void testActualControllerRepeatedZeroTimestampDrops() {
         "repeated zero-timestamp drops and phase resets release obsolete seed after history expiry and fall slew");
 }
 void testActualControllerRequiresAnInputHitch() {
+    for(const int seconds:{10,37,60,120,300}) {
+        for(const int target:{9900,9950,9999}) {
+            VrrSessionConfig settings;settings.experimentalInputPercentilePpm=1;
+            settings.timingOptions={1000,target,seconds,500};
+            const auto configured=vrrTimingParametersForSession(settings);
+            check(configured.playoutInputStableAdaptation==7 &&
+                  configured.playoutInputPercentileWindowUs==uint64_t(seconds)*1000000 &&
+                  configured.playoutInputPercentileTargetPerMillion==uint64_t(target)*100,
+                "production rolling estimator receives the user's custom history and smoothness settings");
+        }
+    }
     VrrSessionConfig session;session.streamRateHz=100;session.displayRefreshHz=240;
     session.latencyMode=1;session.smoothFrameTiming=false;session.experimentalInputPercentilePpm=1;
     session.timingOptions={1000,9950,10,500};
     auto base=vrrTimingParametersForSession(session);
-    check(base.playoutInputHitchMissesOnly==10 && base.playoutInputStableAdaptation==1,"production keeps preventable-miss scoring with stable target adaptation");
+    check(base.playoutInputHitchMissesOnly==11 && base.playoutInputStableAdaptation==7,"production keeps preventable-miss scoring with stable target adaptation");
     base.playoutDelayStartSeedUs=1000;base.playoutDelayMinimumUs=1000;base.playoutDelayMaximumUs=6000;
     base.playoutDelayMaximumPeriodPerMille=base.playoutDelayCapSourcePeriodPerMille=0;
     base.playoutInputLearningTrim=0;
@@ -1256,7 +1713,8 @@ void testActualControllerRequiresAnInputHitch() {
     }
     check(misses[0]>0 && raises[0]>0,"recorded policy must reproduce raw-lateness scoring and growth on clean spacing");
     check(misses[1]==0 && raises[1]==0,"late input without an actual hitch must not affect the goal or grow the buffer");
-    check(misses[2]>0 && raises[2]>0,"the same input spikes must score and grow when they cause preventable hitches");
+    check(misses[2]>0 && misses[2]<=150 && raises[2]>0,
+        "the same input spikes must acquire enough protection to limit repeated preventable hitches");
 }
 
 void testActualControllerPostInputErrorsCannotInflateBuffer() {
@@ -1359,13 +1817,54 @@ void testActualControllerOptInAndEligibility() {
 #endif
 
 }
+void testExactWindowBulkExpiry() {
+    InputPercentileBuffer buffer;
+    buffer.reset(6000);
+    buffer.setStableAdaptation(true);
+    for (uint64_t frame = 1; frame <= 2000; ++frame) {
+        const auto at = 1000000 + frame * 1000;
+        buffer.observe(frame, at, at, 2000 + frame % 31, true,
+            1000, 12000, 995000, 10000000, 1000, 250, 0, 500, 0, 0, false, 10);
+    }
+    auto seeded = buffer;
+    seeded.markEvidenceAsSeed();
+    buffer.advance(12000000);
+    seeded.advance(12000000);
+    const auto partial = buffer.stats();
+    std::vector<int64_t> retained;
+    for (uint64_t frame = 1001; frame <= 2000; ++frame)
+        retained.push_back(2000 + frame % 31);
+    std::sort(retained.begin(), retained.end());
+    check(partial.samples == 1000 && partial.recentEligible == 1000 &&
+          partial.rawRequiredQuantileUs == retained[994] && partial.validPairCoverageUs == 999000,
+          "bulk expiry preserves exact nearest rank, duplicate counts, boundary and pair coverage");
+    check(seeded.stats().samples == 1000 && seeded.stats().recentEligible == 0,
+          "bulk expiry retains seed evidence without inventing eligible outcomes");
+    buffer.advance(11999999);
+    check(buffer.stats().samples == partial.samples && buffer.stats().currentUs == partial.currentUs,
+          "out-of-order advances cannot retire more evidence or spend release time");
+    buffer.advance(13000000);
+    check(buffer.stats().samples == 0 && buffer.stats().eligible == 2000 &&
+          buffer.stats().recentEligible == 0 && buffer.stats().targetUs == 1000,
+          "full expiry clears indexes and window outcomes while retaining session totals");
+}
+
 int main() {
+    testExactWindowBulkExpiry();
     testFastLayerCadence();testConfirmedLayerCadence();testContinuousCoverage();testResponsiveCoverageReporting();
     testGradualLayerGrowthAndHealthyRelease();
     testFeedbackBoundedRelease();
     testAsymmetricLayerBufferMovement();
     testNormalDrainAfterLayerRework();
     testStableTargetKeepsPreventableMissScoring();
+    testFeedbackValidatedStableRelease();
+    testContinuousStableRelease();
+    testSelectedWindowReleaseGate();
+    testRequiredBufferEstimateMath();
+    testRollingEstimateSettingsAndConvergence();
+    testHitchCoverageOwnsAdaptation();
+    testRollingHitchMeanOwnsTarget();
+    testSessionHitchMeanHistory();
     testSharedExtraBufferAllowance();
     testOnlyPreventableHitchesScoreAndGrow();
     testAppliedProtectionFollowsClockCoordinate();
@@ -1383,6 +1882,7 @@ int main() {
     testFastControllerLayerRoundTrip(8,true);
     testFastControllerLayerRoundTrip(9);testFastControllerLayerRoundTrip(9,true);
     testFastControllerLayerRoundTrip(10);testFastControllerLayerRoundTrip(10,true);
+    testFastControllerLayerRoundTrip(10,false,2);testFastControllerLayerRoundTrip(10,true,2);
     testOrdinaryVariationKeepsLayer();
     testRateBaselineStepIsNotClockDrift();
     testActualControllerInputMissReleaseFeedbackApi();

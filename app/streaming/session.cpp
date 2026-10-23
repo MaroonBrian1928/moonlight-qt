@@ -1810,6 +1810,7 @@ public:
 // Called in a non-main thread
 bool Session::startConnectionAsync()
 {
+    m_HostLaunchWarning.clear();
     // The UI should have ensured the old game was already quit
     // if we decide to stream a different game.
     Q_ASSERT(m_Computer->currentGameId == 0 ||
@@ -1839,6 +1840,7 @@ bool Session::startConnectionAsync()
     }
 
     QString rtspSessionUrl;
+    LaunchWarning::Code launchWarning = LaunchWarning::Code::None;
 
     try {
         NvHTTP http(m_Computer);
@@ -1851,7 +1853,8 @@ bool Session::startConnectionAsync()
                       m_InputHandler->getAttachedPlayStationGamepadMask(),
                       !m_Preferences->multiController,
                       m_PresentationSettings.enableVrr,
-                      rtspSessionUrl);
+                      rtspSessionUrl,
+                      launchWarning);
     } catch (const GfeHttpResponseException& e) {
         emit displayLaunchError(tr("Host returned error: %1").arg(e.toQString()));
         return false;
@@ -1971,15 +1974,23 @@ bool Session::startConnectionAsync()
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "PyroWave pacing hints: link %d Mbps, calibrated pace %d Mbps",
                     m_StreamConfig.pyrowaveLinkMbps, m_StreamConfig.pyrowavePaceMbps);
     }
-    int err = LiStartConnection(&hostInfo, &m_StreamConfig, &k_ConnCallbacks,
-                                &m_VideoCallbacks, &m_AudioCallbacks,
-                                NULL, 0, NULL, 0);
+    int err = LiStartConnectionWithSpeakerPcm(&hostInfo, &m_StreamConfig,
+                                              &k_ConnCallbacks,
+                                              &m_VideoCallbacks,
+                                              &m_AudioCallbacks,
+                                              NULL, 0, NULL, 0,
+#if defined(Q_OS_WIN) && SDL_VERSION_ATLEAST(2, 24, 0)
+                                              DualSenseHaptics::receiveSpeaker);
+#else
+                                              nullptr);
+#endif
     if (err != 0) {
         // We already displayed an error dialog in the stage failure
         // listener.
         return false;
     }
 
+    m_HostLaunchWarning = LaunchWarning::text(launchWarning);
     emit connectionStarted();
     return true;
 }
@@ -2287,7 +2298,21 @@ void Session::exec()
         m_VideoDecoder->notifyWindowChanged(&windowChangeInfo);
     };
 
+    // The async thread only supplies this after RTSP connection success. Start
+    // its lifetime when the streaming window is ready, without a Qt dialog.
+    bool hostWarningVisible = !m_HostLaunchWarning.isEmpty();
+    const auto hostWarningExpiresAt = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    if (hostWarningVisible) {
+        m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch,
+                                         m_HostLaunchWarning.toUtf8().toStdString());
+        m_HostLaunchWarning.clear();
+    }
+
     for (;;) {
+        if (hostWarningVisible && std::chrono::steady_clock::now() >= hostWarningExpiresAt) {
+            m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
+            hostWarningVisible = false;
+        }
 #if SDL_VERSION_ATLEAST(2, 0, 18) && !defined(STEAM_LINK)
         // SDL 2.0.18 has a proper wait event implementation that uses platform
         // support to block on events rather than polling on Windows, macOS, X11,
@@ -2689,6 +2714,8 @@ void Session::exec()
     }
 
 DispatchDeferredCleanup:
+    m_OverlayManager.setStatusMessage(Overlay::StatusSource::HostLaunch, "");
+    m_HostLaunchWarning.clear();
     // Switch back to synchronous logging mode
     StreamUtils::exitAsyncLoggingMode();
 

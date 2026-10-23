@@ -3,6 +3,7 @@
 #include "identitymanager.h"
 #include "nvapp.h"
 #include "nvaddress.h"
+#include "launchwarning.h"
 #include "streaming/video/pyrowave/pyrowavelinkpolicy.h"
 #include <atomic>
 #include <functional>
@@ -171,6 +172,9 @@ public:
     QVector<int>
     parseQuad(QString quad);
 
+    // Call only after explicit user confirmation. Exactly one GET and one POST; no retries.
+    void requestHostSleep();
+
     void
     quitApp();
 
@@ -185,7 +189,8 @@ public:
              int playStationGamepadMask,
              bool persistGameControllersOnDisconnect,
              bool clientVrrRequested,
-             QString& rtspSessionUrl);
+             QString& rtspSessionUrl,
+             LaunchWarning::Code& launchWarning);
 
     QVector<NvApp>
     getAppList();
@@ -209,7 +214,10 @@ private:
                    QString arguments,
                    int timeoutMs,
                    NvLogLevel logLevel,
-                   const std::function<QString(QNetworkReply*)>& receiveHeaders = {});
+                   const std::function<QString(QNetworkReply*)>& receiveHeaders = {},
+                   bool powerAction = false,
+                   QNetworkAccessManager::Operation operation = QNetworkAccessManager::GetOperation,
+                   QSslCertificate pairedServerCert = QSslCertificate());
 
     NvAddress m_Address;
     QNetworkAccessManager* m_Nam;

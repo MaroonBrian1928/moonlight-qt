@@ -1,5 +1,6 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h"
 #include "../../app/streaming/video/timinggraph.h"
+#include "vrrproductionsession.h"
 #include <cstdio>
 #include <limits>
 #include <random>
@@ -135,11 +136,96 @@ void rateDropFollow() {
  check(toleranceLimited.latencyUs<=follow.latencyUs+500 && toleranceLimited.missed<=follow.missed+2,
        "T-per-frame layer draining retains prompt low-rate recovery without an instant downward step");
 }
+// End-to-end wiring regression: the packet/RTP clock is constant while
+// decoder service changes and actual source cadence moves within the same
+// cached band. Mode4 must not convert that service phase into oscillator drift.
+void decoderPhaseIsNotClockDrift() {
+ uint64_t legacySpan=0,receiveSpan=0;
+ for(uint64_t revision : {3u,4u}) {
+  VrrSessionConfig cfg;cfg.streamRateHz=116;cfg.displayRefreshHz=120;
+  cfg.latencyMode=1;cfg.experimentalInputPercentilePpm=1;
+  cfg.experimentalBoundedCatchup=true;cfg.smoothFrameTiming=false;
+  cfg.timingOptions={1000,9950,120,500};
+  auto policy=vrrTimingParametersForSession(cfg);policy.playoutInputClockRelativeHistory=revision;
+  VrrTimingController c(cfg,true,policy);
+  uint64_t ticks=0,submitted=0;int64_t lo=std::numeric_limits<int64_t>::max();
+  int64_t hi=std::numeric_limits<int64_t>::min();
+  for(int frame=1;frame<=18000;++frame) {
+   const uint64_t sourceUs=1000000+ticks*100/9;
+   const uint64_t seconds=(sourceUs-1000000)/1000000;
+   ticks+=seconds<60?776:900;
+   const uint64_t slot=1000000+ticks*100/9,receive=slot+2000;
+   const uint64_t phase=seconds>=20&&seconds<60?4000:0;
+   const uint64_t complete=receive+400+2000+phase;
+   PacedFrame f(nullptr,frame,uint32_t(ticks),true,receive+600);
+   f.setDeliveryTimeline(receive,receive+200,receive+400);
+   f.noteGpuReadyUs(complete);f.noteDecodeSyncWaitUs(complete-(receive+600));
+   const auto d=c.schedule(f,std::max(complete,submitted));
+   const uint64_t prepared=std::max(complete,d.renderStartUs)+500;
+   submitted=std::max(prepared,d.targetUs);
+   c.notePreparationDuration(500,0,prepared);c.noteSchedulerDelays(0,0,true);
+   c.noteSubmission(true,false,submitted,submitted);
+   if(seconds>=35&&seconds<=110) {
+    const int64_t relative=c.intervalStats().inputPercentile.clockOffsetUs-c.playoutOffsetUs();
+    lo=std::min(lo,relative);hi=std::max(hi,relative);
+   }
+  }
+  if(revision==3)legacySpan=uint64_t(hi-lo);else receiveSpan=uint64_t(hi-lo);
+ }
+ check(legacySpan>1000,"legacy drift fit mistakes a decoder phase for clock motion");
+ check(receiveSpan<=5,"receive clock preserves the packet clock across decoder phase and116->100 cadence");
+}
+// 2026-10-20 4K PyroWave: a full frame's ~620 packets are paced over 3.35 ms,
+// while an occasional small frame finishes its send in 0.3 ms, so its last
+// packet arrives ~3 ms early. Bursts of them pulled the playout offset's
+// window minimum earlier; the full frames after them measured late and grew
+// the buffer by 2-3 ms for its whole 120 s history although none was shown
+// late. `latencyDropUs` instead moves every full frame earlier for good.
+struct SpanRun{uint64_t peakBufferUs,missed;double tailLatencyUs;};
+SpanRun sendSpanRun(uint64_t normalization,bool bursts,uint64_t latencyDropUs=0,bool sustainedSmall=false) {
+ auto cfg=vrrProductionSession(1,120,120);
+ auto policy=vrrTimingParametersForSession(cfg);policy.playoutDelayStartSeedUs=1000;
+ policy.playoutOffsetSendSpanNormalization=normalization;
+ VrrTimingController c(cfg,true,policy);uint64_t slot=1000000,submitted=0,peak=0;uint32_t pts=0;
+ std::mt19937_64 rng(11);std::uniform_int_distribution<uint64_t> jitter(0,500);
+ const uint64_t period=9091,frames=110*240;double tail=0;uint64_t tailCount=0,missedBefore=0;
+ for(uint64_t frame=0;frame<frames;++frame) {
+  slot+=period;pts+=818;const uint64_t second=frame/110;
+  const bool late=second>=120;
+  const bool small=(bursts&&late&&second%30<2&&frame%2==0)||(sustainedSmall&&late&&second<150);
+  const uint64_t receive=slot+2000-(small?500:0)+jitter(rng)-(late?latencyDropUs:0);
+  const uint64_t reassembled=receive+(small?300:3350),submit=reassembled+100,ready=submit+600;
+  PacedFrame f(nullptr,int(frame),pts,true,ready);f.setDeliveryTimeline(receive,reassembled,submit);
+  const auto d=c.schedule(f,std::max(ready,submitted));
+  const uint64_t prepared=std::max(ready,d.renderStartUs)+500;
+  submitted=std::max(prepared,d.targetUs);c.notePreparationDuration(500,0,prepared);
+  c.noteSchedulerDelays(0,0,true);c.noteSubmission(true,false,submitted,submitted);
+  if(frame+1==120*110) missedBefore=c.intervalStats().inputPercentile.missed;
+  if(late) peak=std::max(peak,d.playoutDelayUs);
+  if(second>=225&&!small){tail+=double(submitted-ready);++tailCount;}
+ }
+ return {peak,c.intervalStats().inputPercentile.missed-missedBefore,tail/tailCount};
+}
+void smallFramesDoNotMoveOffset() {
+ const auto quiet=sendSpanRun(1,false),raw=sendSpanRun(0,true),fixed=sendSpanRun(1,true);
+ std::printf("small-frame bursts: buffer peak quiet %llu, raw %llu (%llu misses), normalized %llu (%llu misses)\n",
+  (unsigned long long)quiet.peakBufferUs,(unsigned long long)raw.peakBufferUs,(unsigned long long)raw.missed,
+  (unsigned long long)fixed.peakBufferUs,(unsigned long long)fixed.missed);
+ check(raw.peakBufferUs>=quiet.peakBufferUs+1500,"fixture reproduces the small-frame buffer rise without normalization");
+ check(fixed.peakBufferUs<=quiet.peakBufferUs+300&&fixed.missed<=quiet.missed+5,"small early frames do not pull the offset ahead of full frames");
+ const auto dropRaw=sendSpanRun(0,false,3000),dropFixed=sendSpanRun(1,false,3000);
+ std::printf("lasting 3 ms latency drop: tail ready-to-present raw %.0f us, normalized %.0f us\n",dropRaw.tailLatencyUs,dropFixed.tailLatencyUs);
+ check(dropFixed.tailLatencyUs<=dropRaw.tailLatencyUs+200,"a real latency drop of full frames is still adopted");
+ const auto allSmallRaw=sendSpanRun(0,false,0,true),allSmallFixed=sendSpanRun(1,false,0,true);
+ check(allSmallFixed.peakBufferUs<=allSmallRaw.peakBufferUs+300,"a sustained small-frame scene becomes the typical span");
+}
+
 int main(){
+ smallFramesDoNotMoveOffset();
  VrrSessionConfig cfg;cfg.streamRateHz=76;cfg.displayRefreshHz=120;cfg.latencyMode=0;cfg.experimentalInputPercentilePpm=1;cfg.experimentalBoundedCatchup=true;cfg.timingOptions={4000,9995,300,500};
  auto p=vrrTimingParametersForSession(cfg);VrrTimingController c(cfg,true,p);
- check(p.playoutInputHitchMissesOnly==10,"new sessions use fast rate layers while historical clock comparisons remain explicit");
- check(p.playoutInputClockRelativeHistory==3&&p.playoutInputBoundedRecoveryCredit==0&&p.playoutInputRateDropSnap==1&&
+ check(p.playoutInputHitchMissesOnly==11,"new sessions use fast rate layers while historical clock comparisons remain explicit");
+ check(p.playoutInputClockRelativeHistory==4&&p.playoutInputBoundedRecoveryCredit==0&&p.playoutInputRateDropSnap==1&&
        p.playoutInputLayerSeedRatioPerMille==1500&&p.playoutInputLearningTrim==1,"current main enables corrected accounting with physical recovery credit");
  check(p.playoutInputRecoveryCreditRoomPerMille==50&&c.recoveryHeadroomUs()>4800&&
        c.inputRecoveryCreditUs()+1>=c.recoveryHeadroomUs()/20&&c.inputRecoveryCreditUs()<=c.recoveryHeadroomUs()/20+1,"Smooth credits a twentieth of the physical VRR room");
@@ -161,6 +247,7 @@ int main(){
  InputPercentileBuffer signs;signs.reset(1000);observe(signs,1,-1000,100000);check(signs.stats().missed==0&&signs.stats().targetUs==1000,"negative normalized readiness invents no demand");observe(signs,2,2000,100000);check(signs.stats().missed==0,"exact B+T+credit equality is covered");observe(signs,3,2001,100000);check(signs.stats().missed==1,"strict boundary counts one microsecond excess");
  InputPercentileBuffer extremes;extremes.reset(1000);observe(extremes,1,std::numeric_limits<int64_t>::max()-5,100);check(extremes.stats().currentUs<=25000&&extremes.stats().clipped,"signed source-coordinate addition saturates at policy cap");extremes.advance(1020000,1000,25000,999500,300000000,1000,250,0,500,500,std::numeric_limits<int64_t>::min());check(extremes.stats().targetUs==25000,"signed projection saturates safely");
  Overlay::TimingGraphPoint g;g.sourceTimingValid=true;g.sourceTimeUs=100000;g.bufferUs=1000;g.inputPercentileEnabled=true;g.producerEligible=true;g.inputToleranceUs=500;g.inputVrrHeadroomUs=500;g.producerRequiredUs=-1000;auto graph=Overlay::bufferGraphSample(g);check(graph.producerUs==-1500&&!graph.producerMissed()&&graph.bufferUs==1000,"signed graph readiness remains separate from standing buffer");
+ decoderPhaseIsNotClockDrift();
  rateRoundTrip();
  clockDrift();
  rateDropFollow();

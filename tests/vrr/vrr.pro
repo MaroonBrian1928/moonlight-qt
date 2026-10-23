@@ -13,6 +13,8 @@ SUBDIRS += dxgipresent
 
 presentationclock.file = $$PWD/presentationclock.pro
 SUBDIRS += presentationclock
+tracemetrics.file = $$PWD/tracemetrics.pro
+SUBDIRS += tracemetrics
 compositionpresentpolicy.file = $$PWD/compositionpresentpolicy.pro
 SUBDIRS += compositionpresentpolicy
 
@@ -26,6 +28,8 @@ unix:!macx:packagesExist(libplacebo) {
     SUBDIRS += plvkpresentation
     plvkswapchain.file = $$PWD/plvkswapchain.pro
     SUBDIRS += plvkswapchain
+    plvkoffscreen.file = $$PWD/plvkoffscreen.pro
+    SUBDIRS += plvkoffscreen
 }
 
 unix:!macx:packagesExist(sdl2) {
@@ -67,6 +71,8 @@ ratepolicy.file = $$PWD/ratepolicy.pro
 diagnostics.file = $$PWD/diagnostics.pro
 pacingworker.file = $$PWD/pacingworker.pro
 replay.file = $$PWD/replay.pro
+workerreplay.file = $$PWD/workerreplay.pro
+SUBDIRS += workerreplay
 replayconfig.file = $$PWD/replayconfig.pro
 queuesim.file = $$PWD/queuesim.pro
 
@@ -96,6 +102,13 @@ phasetrajectory.file = $$PWD/phasetrajectory.pro
 SUBDIRS += phasetrajectory
 inputpercentileintegration.file = $$PWD/inputpercentileintegration.pro
 SUBDIRS += inputpercentileintegration
+inputcontracts.file = $$PWD/inputcontracts.pro
+SUBDIRS += inputcontracts
+# Production-policy buffer regression gate; fast enough to run on every build.
+bufferregressions.file = $$PWD/bufferregressions.pro
+SUBDIRS += bufferregressions
+rollingquantile.file = $$PWD/rollingquantile.pro
+SUBDIRS += rollingquantile
 
 performancestats.file = $$PWD/performancestats.pro
 SUBDIRS += performancestats
@@ -103,3 +116,13 @@ SUBDIRS += performancestats
 # Clock-relative history and bounded recovery credit regression.
 SUBDIRS += inputaccounting
 inputaccounting.file = $$PWD/inputaccounting.pro
+
+receivedriftclock.file = $$PWD/receivedriftclock.pro
+SUBDIRS += receivedriftclock
+
+# Effective production policy must select the matching cache namespace.
+vrrcacheidentity.file = $$PWD/vrrcacheidentity.pro
+SUBDIRS += vrrcacheidentity
+
+inputtracechunks.file = $$PWD/inputtracechunks.pro
+SUBDIRS += inputtracechunks

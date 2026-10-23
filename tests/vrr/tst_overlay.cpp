@@ -730,6 +730,16 @@ int main(int argc, char** argv)
         manager.setStatusMessage(StatusSource::Mouse, "");
         assert(manager.getOverlayText(OverlayStatusUpdate) == "client pacing");
         manager.setStatusMessage(StatusSource::ClientPacing, "");
+        manager.setStatusMessage(StatusSource::HostLaunch, "host display warning");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "host display warning");
+        manager.setStatusMessage(StatusSource::Mouse, "mouse");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "mouse\n\nhost display warning");
+        manager.setStatusMessage(StatusSource::Network, "network loss");
+        manager.setStatusMessage(StatusSource::HostLaunch, "");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "mouse");
+        manager.setStatusMessage(StatusSource::Mouse, "");
+        assert(manager.getOverlayText(OverlayStatusUpdate) == "network loss");
+        manager.setStatusMessage(StatusSource::Network, "");
         const auto statusColor = manager.getOverlayColor(OverlayStatusUpdate);
         assert(statusColor.r > 0 && statusColor.g == 0 && statusColor.b == 0);
         assert(!manager.isOverlayEnabled(OverlayStatusUpdate));
@@ -871,8 +881,7 @@ int main(int argc, char** argv)
                     "Frames dropped by client pacing: 0.00%\n"
                     "Average network latency: 2 ms (variance: 1 ms)\n"
                     "Average decoding time: 3.85 ms (waiting for the decoder 0.02 ms)\n"
-                    "Average frame queue delay: 6.42 ms\n"
-                    "Average rendering time (including monitor V-sync latency): 1.20 ms\n"
+                    + PerformanceStats::formatClientTiming(11503, 8010, 1285, 1) +
                     "Incoming smoothness (host): 99.50%\n";
                 PerformanceStats::Snapshot summary;
                 summary.vrr = summary.adaptive = true; summary.bufferUs = 5700;

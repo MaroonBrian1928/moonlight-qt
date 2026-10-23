@@ -3,6 +3,7 @@
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.h"
 #include "vrrreplayconfig.h"
 #include "vrrreplaymodel.h"
+#include "vrrreplaymetrics.h"
 #include "../../app/streaming/video/ffmpeg-renderers/pacer/vrr/readinesswindow.h"
 
 #include <QCommandLineParser>
@@ -282,6 +283,11 @@ enum class TraceValueKind {
 
 TraceValueKind traceValueKind(const QByteArray& name)
 {
+#define VRR_AUDIT_COLUMN_KIND(type,jsonName,member) \
+    if constexpr(std::is_signed<type>::value) \
+        if(name=="buffer_before_" #jsonName || name=="buffer_after_" #jsonName) return TraceValueKind::Signed;
+    VRR_BUFFER_AUDIT_FIELDS(VRR_AUDIT_COLUMN_KIND)
+#undef VRR_AUDIT_COLUMN_KIND
     static const QSet<QByteArray> signedColumns {
         "trajectory_successor_frame",
         "input_percentile_last_input_required_us",
@@ -1275,286 +1281,8 @@ private:
     int m_Maximum = -1;
 };
 
-// Schema default for a controller parameter path, as text, or empty when the
-// path is not a controller parameter.
-QString vrrControllerParameterDefaultText(const QString& path)
-{
-#define VRR_REPLAY_PARAMETER_DEFAULT(type, jsonName, memberName, defaultValue) \
-    if (path == QStringLiteral("controller." #jsonName)) { \
-        return QString::number(static_cast<qulonglong>(defaultValue)); \
-    }
-    VRR_TIMING_PARAMETER_FIELDS(VRR_REPLAY_PARAMETER_DEFAULT)
-#undef VRR_REPLAY_PARAMETER_DEFAULT
-    return QString();
-}
-
-struct Distribution {
-    static constexpr uint64_t kExactLimitUs = 100000;
-    static constexpr uint64_t kMediumLimitUs = 1000000;
-    static constexpr uint64_t kLongLimitUs = 60000000;
-    static constexpr uint64_t kMediumBucketUs = 100;
-    static constexpr uint64_t kLongBucketUs = 1000;
-    static constexpr size_t kExactBuckets = kExactLimitUs + 1;
-    static constexpr size_t kMediumBuckets =
-        (kMediumLimitUs - kExactLimitUs + kMediumBucketUs - 1) /
-            kMediumBucketUs;
-    static constexpr size_t kLongBuckets =
-        (kLongLimitUs - kMediumLimitUs + kLongBucketUs - 1) /
-            kLongBucketUs;
-    static constexpr size_t kOverflowBucket =
-        kExactBuckets + kMediumBuckets + kLongBuckets;
-    static constexpr size_t kBucketCount = kOverflowBucket + 1;
-    static constexpr size_t kPageSize = 256;
-    static constexpr size_t kPageCount =
-        (kBucketCount + kPageSize - 1) / kPageSize;
-    using HistogramPage = std::array<uint32_t, kPageSize>;
-
-    uint64_t count = 0;
-    uint64_t minimum = 0;
-    uint64_t maximum = 0;
-    long double mean = 0;
-    long double squaredDifferenceTotal = 0;
-    // Most distributions occupy only a few of the 168k possible buckets.
-    // Keep exact bucket counts without allocating the whole range per metric.
-    std::vector<std::unique_ptr<HistogramPage>> histogram;
-    std::vector<uint64_t> pageTotals;
-
-    static size_t bucketFor(uint64_t value)
-    {
-        if (value <= kExactLimitUs) {
-            return static_cast<size_t>(value);
-        }
-        if (value <= kMediumLimitUs) {
-            return kExactBuckets + static_cast<size_t>(
-                (value - kExactLimitUs - 1) / kMediumBucketUs);
-        }
-        if (value <= kLongLimitUs) {
-            return kExactBuckets + kMediumBuckets + static_cast<size_t>(
-                (value - kMediumLimitUs - 1) / kLongBucketUs);
-        }
-        return kOverflowBucket;
-    }
-
-    uint64_t bucketUpperBound(size_t bucket) const
-    {
-        if (bucket < kExactBuckets) {
-            return static_cast<uint64_t>(bucket);
-        }
-        if (bucket < kExactBuckets + kMediumBuckets) {
-            const uint64_t offset = static_cast<uint64_t>(
-                bucket - kExactBuckets + 1);
-            return std::min(kMediumLimitUs,
-                            kExactLimitUs + offset * kMediumBucketUs);
-        }
-        if (bucket < kOverflowBucket) {
-            const uint64_t offset = static_cast<uint64_t>(
-                bucket - kExactBuckets - kMediumBuckets + 1);
-            return std::min(kLongLimitUs,
-                            kMediumLimitUs + offset * kLongBucketUs);
-        }
-        return maximum;
-    }
-
-    void add(uint64_t value)
-    {
-        if (count == 0) {
-            minimum = value;
-            maximum = value;
-            histogram.resize(kPageCount);
-            pageTotals.resize(kPageCount);
-        }
-        else {
-            minimum = std::min(minimum, value);
-            maximum = std::max(maximum, value);
-        }
-        ++count;
-        const long double delta = static_cast<long double>(value) - mean;
-        mean += delta / static_cast<long double>(count);
-        const long double adjustedDelta =
-            static_cast<long double>(value) - mean;
-        squaredDifferenceTotal += delta * adjustedDelta;
-        const size_t bucket = bucketFor(value);
-        const size_t pageIndex = bucket / kPageSize;
-        auto& page = histogram[pageIndex];
-        if (!page) page = std::make_unique<HistogramPage>();
-        ++(*page)[bucket % kPageSize];
-        ++pageTotals[pageIndex];
-    }
-
-    void addElapsed(uint64_t endUs, uint64_t startUs)
-    {
-        if (startUs != 0 && endUs >= startUs) {
-            add(endUs - startUs);
-        }
-    }
-
-    uint64_t percentileRatio(uint64_t numerator, uint64_t denominator) const
-    {
-        if (count == 0 || denominator == 0) {
-            return 0;
-        }
-        const uint64_t boundedNumerator = std::min(denominator, numerator);
-        const uint64_t rank = std::max<uint64_t>(
-            1,
-            (count / denominator) * boundedNumerator +
-                ((count % denominator) * boundedNumerator +
-                 denominator - 1) /
-                    denominator);
-        uint64_t cumulative = 0;
-        for (size_t pageIndex = 0; pageIndex < pageTotals.size(); ++pageIndex) {
-            if (cumulative + pageTotals[pageIndex] < rank) {
-                cumulative += pageTotals[pageIndex];
-                continue;
-            }
-            const HistogramPage& page = *histogram[pageIndex];
-            for (size_t offset = 0; offset < kPageSize; ++offset) {
-                const size_t bucket = pageIndex * kPageSize + offset;
-                if (bucket >= kBucketCount) break;
-                cumulative += page[offset];
-                if (cumulative >= rank) {
-                    return bucketUpperBound(bucket);
-                }
-            }
-        }
-        return maximum;
-    }
-
-    uint64_t percentile(unsigned int percent) const
-    {
-        return percentileRatio(percent, 100);
-    }
-};
-
-// Sender-spacing cadence. Compares each consecutive pair of presented
-// submissions against the sender's own RTP spacing, which is the cadence the
-// game produced. Pairs whose sender or arrival interval exceeds the stall
-// threshold are excluded so host capture stalls do not dominate the tails. A
-// hitch is a pair presented more than two milliseconds wider than the sender
-// spacing; hitches are attributed to a frame that arrived later than the
-// playout delay, a render-lead jump, the display-spacing floor, or other.
-struct SenderCadenceTracker {
-    static constexpr uint64_t kStallIntervalUs = 25000;
-    static constexpr uint64_t kHitchUs = 2000;
-    static constexpr uint64_t kRenderLeadJumpUs = 500;
-    static constexpr uint64_t kFloorSlackUs = 300;
-
-    bool havePrior = false;
-    bool haveResidual = false;
-    uint64_t priorSenderUs = 0;
-    uint64_t priorDecodeUs = 0;
-    uint64_t priorSubmissionUs = 0;
-    int64_t priorResidualUs = 0;
-    uint64_t pairs = 0;
-    uint64_t hitches = 0;
-    uint64_t spacingErrorsOverHitch = 0;
-    uint64_t clientSpacingPairs = 0;
-    uint64_t clientSpacingErrorsOver3ms = 0;
-    uint64_t sourceStallPairs = 0;
-    Distribution clientSpacingErrorUs;
-    uint64_t hitchLateArrivals = 0;
-    uint64_t hitchRenderLeadJumps = 0;
-    uint64_t hitchDisplayFloor = 0;
-    uint64_t hitchOther = 0;
-    Distribution absoluteSpacingErrorUs;
-    Distribution absoluteJerkUs;
-    // Evenness of what was shown, independent of the sender: the change in
-    // presented interval from one pair to the next. This is the quantity the
-    // viewer perceives as stutter; matching a jittery sender scores well on
-    // the fields above and badly here.
-    bool havePresentedInterval = false;
-    uint64_t priorPresentedIntervalUs = 0;
-    uint64_t presentedJerkPairs = 0;
-    uint64_t presentedJerkOverHitch = 0;
-    Distribution presentedJerkUs;
-
-    void observe(uint64_t senderUs, uint64_t decodeUs, uint64_t submissionUs,
-                 bool lateArrival, bool renderLeadJump,
-                 uint64_t displayPeriodUs)
-    {
-        if (havePrior && senderUs > priorSenderUs &&
-                decodeUs >= priorDecodeUs &&
-                submissionUs >= priorSubmissionUs) {
-            const uint64_t senderIntervalUs = senderUs - priorSenderUs;
-            const uint64_t arrivalIntervalUs = decodeUs - priorDecodeUs;
-            if (senderIntervalUs <= kStallIntervalUs) {
-                // The user's 3 ms client-error goal must include network and
-                // decode stalls. Only a gap on the source clock is excluded;
-                // a long local arrival gap cannot excuse a client hitch.
-                const uint64_t actual = submissionUs - priorSubmissionUs;
-                const uint64_t error = actual > senderIntervalUs ?
-                    actual - senderIntervalUs : senderIntervalUs - actual;
-                ++clientSpacingPairs;
-                clientSpacingErrorsOver3ms += error > 3000;
-                clientSpacingErrorUs.add(error);
-            }
-            else {
-                ++sourceStallPairs;
-            }
-            if (senderIntervalUs <= kStallIntervalUs &&
-                    arrivalIntervalUs <= kStallIntervalUs) {
-                const uint64_t submissionIntervalUs =
-                    submissionUs - priorSubmissionUs;
-                if (havePresentedInterval) {
-                    const uint64_t jerkUs =
-                        submissionIntervalUs > priorPresentedIntervalUs ?
-                            submissionIntervalUs - priorPresentedIntervalUs :
-                            priorPresentedIntervalUs - submissionIntervalUs;
-                    presentedJerkUs.add(jerkUs);
-                    ++presentedJerkPairs;
-                    if (jerkUs > kHitchUs) {
-                        ++presentedJerkOverHitch;
-                    }
-                }
-                havePresentedInterval = true;
-                priorPresentedIntervalUs = submissionIntervalUs;
-                const int64_t residualUs =
-                    static_cast<int64_t>(submissionIntervalUs) -
-                    static_cast<int64_t>(senderIntervalUs);
-                ++pairs;
-                absoluteSpacingErrorUs.add(static_cast<uint64_t>(
-                    residualUs < 0 ? -residualUs : residualUs));
-                spacingErrorsOverHitch += residualUs > static_cast<int64_t>(kHitchUs) ||
-                    residualUs < -static_cast<int64_t>(kHitchUs);
-                if (haveResidual) {
-                    const int64_t jerkUs = residualUs - priorResidualUs;
-                    absoluteJerkUs.add(static_cast<uint64_t>(
-                        jerkUs < 0 ? -jerkUs : jerkUs));
-                }
-                haveResidual = true;
-                priorResidualUs = residualUs;
-                if (residualUs > static_cast<int64_t>(kHitchUs)) {
-                    ++hitches;
-                    if (lateArrival) {
-                        ++hitchLateArrivals;
-                    }
-                    else if (renderLeadJump) {
-                        ++hitchRenderLeadJumps;
-                    }
-                    else if (senderIntervalUs < displayPeriodUs &&
-                             submissionIntervalUs <=
-                                 displayPeriodUs + kFloorSlackUs) {
-                        ++hitchDisplayFloor;
-                    }
-                    else {
-                        ++hitchOther;
-                    }
-                }
-            }
-            else {
-                haveResidual = false;
-                havePresentedInterval = false;
-            }
-        }
-        else {
-            haveResidual = false;
-            havePresentedInterval = false;
-        }
-        havePrior = true;
-        priorSenderUs = senderUs;
-        priorDecodeUs = decodeUs;
-        priorSubmissionUs = submissionUs;
-    }
-};
+using VrrReplayMetrics::Distribution;
+using VrrReplayMetrics::SenderCadenceTracker;
 
 // Rate-band and paired-delta diagnostics are supplemental. Keep their memory
 // fixed even for multi-hour or unusually high-rate traces while retaining
@@ -1774,6 +1502,9 @@ struct RasterEnvelopeMetrics {
 };
 
 struct Metrics {
+    uint64_t bufferAuditComparedRows=0, bufferAuditMismatchedRows=0;
+    QMap<QString,uint64_t> bufferAuditFieldMismatches;
+    QJsonArray bufferAuditFirstMismatches;
     Vrr13::ReadinessWindow observedReadiness;
     Vrr13::ReadinessWindow simulatedReadiness;
     uint64_t feedbackCapacityLimitedFrames = 0;
@@ -6309,7 +6040,13 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
             metrics.exactPresentRefreshCorrelations;
     fidelity["invalid_execution_residuals"] = static_cast<qint64>(
         metrics.invalidExecutionResiduals);
+    fidelity["buffer_audit_compared_rows"] = qint64(metrics.bufferAuditComparedRows);
+    fidelity["buffer_audit_mismatched_rows"] = qint64(metrics.bufferAuditMismatchedRows);
+    QJsonObject auditFields;for(auto it=metrics.bufferAuditFieldMismatches.begin();it!=metrics.bufferAuditFieldMismatches.end();++it) auditFields[it.key()]=qint64(it.value());
+    fidelity["buffer_audit_field_mismatches"]=auditFields;
+    fidelity["buffer_audit_first_mismatches"]=metrics.bufferAuditFirstMismatches;
     fidelity["baseline_exact"] = metrics.traceSchema == 5 &&
+        metrics.bufferAuditMismatchedRows == 0 &&
         arrivalSequenceComplete &&
         semanticIntegrityReady &&
         metrics.displayRefreshMismatchRows == 0 &&
@@ -7351,6 +7088,11 @@ QJsonObject summaryObject(const Metrics& metrics, qint64 elapsedMs,
 }
 
 struct TimelineDetails {
+    bool bufferAuditValid = false;
+    uint32_t sourceRtp = 0;
+    bool sourceRtpValid = false;
+    VrrBufferAuditSnapshot bufferBefore, bufferAfter;
+    Vrr13::IntervalBuffer::Stats feedbackStats;
     uint64_t decoderOutputUs = 0;
     int recordedSourceRateHz = 0;
     int simulatedSourceRateHz = 0;
@@ -7730,7 +7472,15 @@ bool writeTimelineHeader(QFile& file)
         "recorded_free_running_scanout_position_ppm,"
         "simulated_free_running_scanout_position_valid,"
         "simulated_free_running_scanout_position_ppm,"
-        "simulated_presentation_floor_push_us,simulated_recovery_added_us\n";
+        "simulated_presentation_floor_push_us,simulated_recovery_added_us"
+        ",trace_model_kind,rtp_timestamp,rtp_valid,buffer_audit_revision"
+#define VRR_TIMELINE_BEFORE_HEADER(type,name,member) ",buffer_before_" #name
+        VRR_BUFFER_AUDIT_FIELDS(VRR_TIMELINE_BEFORE_HEADER)
+#undef VRR_TIMELINE_BEFORE_HEADER
+#define VRR_TIMELINE_AFTER_HEADER(type,name,member) ",buffer_after_" #name
+        VRR_BUFFER_AUDIT_FIELDS(VRR_TIMELINE_AFTER_HEADER)
+#undef VRR_TIMELINE_AFTER_HEADER
+        ",buffer_update_frame,buffer_attributed_frame,buffer_interval_error_us,buffer_lateness_us,input_percentile_last_input_eligible,input_percentile_last_input_required_us,input_percentile_recent_eligible,input_percentile_recent_missed\n";
     return file.write(header) == header.size();
 }
 
@@ -8134,6 +7884,26 @@ bool writeTimelineRow(QFile& file, uint64_t arrivalSequence, int frame,
         details.simulatedRaster.freeRunningScanoutPositionPpm));
     append(QByteArray::number(details.simulatedPresentationFloorPushUs));
     append(QByteArray::number(details.simulatedRecoveryAddedUs));
+    append(QByteArray("1")); // Frozen recorded-admission replay, not closed loop.
+    append(QByteArray::number(details.sourceRtp));
+    append(QByteArray::number(details.sourceRtpValid?1:0));
+    append(QByteArray::number(details.bufferAuditValid?1:0));
+    const auto appendBufferAudit=[&](const VrrBufferAuditSnapshot&a) {
+#define VRR_TIMELINE_AUDIT_VALUE(type,name,member) \
+        if constexpr(std::is_signed<type>::value) append(QByteArray::number(static_cast<qlonglong>(a.member))); \
+        else append(QByteArray::number(static_cast<qulonglong>(a.member)));
+        VRR_BUFFER_AUDIT_FIELDS(VRR_TIMELINE_AUDIT_VALUE)
+#undef VRR_TIMELINE_AUDIT_VALUE
+    };
+    appendBufferAudit(details.bufferBefore);appendBufferAudit(details.bufferAfter);
+    append(QByteArray::number(qulonglong(details.feedbackStats.update.frame)));
+    append(QByteArray::number(qulonglong(details.feedbackStats.update.attributedFrame)));
+    append(QByteArray::number(qulonglong(details.feedbackStats.update.intervalErrorUs)));
+    append(QByteArray::number(qulonglong(details.feedbackStats.update.latenessUs)));
+    append(QByteArray::number(details.feedbackStats.inputPercentile.lastInputEligible?1:0));
+    append(QByteArray::number(qlonglong(details.feedbackStats.inputPercentile.lastInputRequiredUs)));
+    append(QByteArray::number(qulonglong(details.feedbackStats.inputPercentile.recentEligible)));
+    append(QByteArray::number(qulonglong(details.feedbackStats.inputPercentile.recentMissed)));
     line.append('\n');
     return file.write(line) == line.size();
 }
@@ -8955,6 +8725,7 @@ int main(int argc, char* argv[])
         uint64_t nativeDisplayDeadlineUncertaintyUs = 0;
     };
     std::deque<SubmissionBand> pendingSubmissionBands;
+    VrrTrajectorySuccessorAudit trajectorySuccessorAudit;
 
     QElapsedTimer timer;
     timer.start();
@@ -11040,6 +10811,13 @@ int main(int argc, char* argv[])
         const uint64_t decisionUs = unsignedField(fields, columns.decisionUs);
         const bool rowDecisionValid =
             unsignedField(fields, columns.decisionValid) != 0;
+        if (!trajectorySuccessorAudit.observe(frameNumber, rowDecisionValid,
+                disposition == "shutdown_discard" || disposition == "suspension_discard",
+                optionalUnsignedField(fields, traceColumn("prepared_ahead")) != 0,
+                optionalUnsignedField(fields, traceColumn("decode_readiness_observed")) != 0,
+                decodeCompleteUs, optionalUnsignedField(fields, traceColumn("stage_ready_us")),
+                dequeueUs, decoderOutputUs))
+            ++metrics.invalidControllerLifecycleRows;
         const bool readinessOutcome = disposition == "presented" || disposition == "output_dropped" ||
             disposition == "queue_capacity" || disposition == "queue_stale" ||
             disposition == "stale" || disposition == "preparation_failed";
@@ -11116,7 +10894,8 @@ int main(int argc, char* argv[])
                 // selection is independent of that timestamp contract.
                 optionalUnsignedField(fields, columns.capturedParameterColumns.value(
                     QStringLiteral("controller.playout_serial_service_gate"), -1)) >= 2,
-                optionalUnsignedField(fields, traceColumn("decode_readiness_observed")) != 0);
+                optionalUnsignedField(fields, traceColumn("decode_readiness_observed")) != 0,
+                traceColumn("decode_readiness_observed") >= 0);
         const auto stageField = [&](const char* name) {
             return optionalUnsignedField(fields, traceColumn(name));
         };
@@ -11983,74 +11762,8 @@ int main(int argc, char* argv[])
                         // absolute latch thresholds, allow base-guard latch
                         // exit, and predate render-tail pacing budgets; new
                         // traces record all of these explicitly.
-                        QString legacyValue;
-                        if (path ==
-                                "controller.render_baseline_percentile") {
-                            legacyValue = "50";
-                        }
-                        else if (path ==
-                                 "controller.pacing_latency_budget_divisor") {
-                            legacyValue = "0";
-                        }
-                        else if (path.endsWith("_period_numerator")) {
-                            legacyValue = "0";
-                        }
-                        else if (path.endsWith("_period_denominator")) {
-                            legacyValue = "1";
-                        }
-                        else if (path ==
-                                 "controller.latch_base_guard_exit") {
-                            legacyValue = "1";
-                        }
-                        else if (path ==
-                                 "controller.cadence_stability_latch_frames") {
-                            // Captures made before cadence-instability
-                            // protection must retain their recorded adaptive
-                            // presentation decisions for exact replay.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.source_playout_delay_us") {
-                            // Older schema-5 captures predate the explicit
-                            // source-clock playout reserve.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.readiness_learning_window_us" ||
-                                 path ==
-                                 "controller.retain_readiness_on_phase_reset") {
-                            // Older schema-5 captures used a fixed sample
-                            // count and reacquired readiness after each phase
-                            // reset.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.timestamp_playout_enabled") {
-                            // Older schema-5 captures predate timestamp
-                            // playout and always projected a source clock.
-                            legacyValue = "0";
-                        }
-                        else if (path ==
-                                 "controller.playout_offset_window_us") {
-                            legacyValue = "3000000";
-                        }
-                        else if (path ==
-                                 "controller.playout_offset_slew_us") {
-                            legacyValue = "20";
-                        }
-                        else if (path ==
-                                 "controller.playout_offset_warmup_samples") {
-                            legacyValue = "64";
-                        }
-                        else {
-                            // Any parameter added after a capture was made
-                            // takes its schema default: older captures ran
-                            // the controller exactly as if the parameter
-                            // did not exist, which is what the default
-                            // expresses.
-                            legacyValue =
-                                vrrControllerParameterDefaultText(path);
-                        }
+                        const QString legacyValue =
+                            vrrLegacyControllerParameterDefaultText(path);
                         bool validLegacyValue = false;
                         capturedValue = legacyValue.toULongLong(
                             &validLegacyValue);
@@ -13473,8 +13186,13 @@ int main(int argc, char* argv[])
         }
         const VrrTimingDecision referenceDecision =
             referenceController->schedule(frame, decisionUs);
+        const auto referenceBufferBefore=referenceController->bufferAudit(decisionUs,referenceDecision.playoutDelayUs);
         const VrrTimingDecision simulatedDecision =
             simulatedController->schedule(frame, simulatedDecisionUs);
+        timelineDetails.bufferAuditValid=true;
+        timelineDetails.sourceRtp=frame.rtpTimestamp();
+        timelineDetails.sourceRtpValid=frame.timestampValid();
+        timelineDetails.bufferBefore=simulatedController->bufferAudit(simulatedDecisionUs,simulatedDecision.playoutDelayUs);
         if (traceContains("trajectory_resync_dropped")) {
             const bool resyncDrop=optionalUnsignedField(fields,traceColumn("trajectory_resync_dropped"))!=0;
             const bool resyncDeferred=optionalUnsignedField(fields,traceColumn("trajectory_resync_deferred"))!=0;
@@ -13482,7 +13200,8 @@ int main(int argc, char* argv[])
                 (resyncDrop && disposition!="stale")) ++metrics.invalidControllerLifecycleRows;
             const int64_t successorFrame=optionalSignedField(fields,traceColumn("trajectory_successor_frame"));
             const uint64_t successorProof=optionalUnsignedField(fields,traceColumn("trajectory_successor_proof"));
-            if(resyncDrop && (successorFrame<=frameNumber || (successorProof!=1 && successorProof!=2)))
+            if(resyncDrop && !trajectorySuccessorAudit.expect(frameNumber, successorFrame,
+                    successorProof, optionalUnsignedField(fields, columns.staleCheckUs)))
                 ++metrics.invalidControllerLifecycleRows;
             // This validates the recorded reservation contract, not physical GPU completion.
             if(resyncDrop) {referenceController->noteTrajectoryResyncDrop();simulatedController->noteTrajectoryResyncDrop();}
@@ -14178,6 +13897,22 @@ int main(int argc, char* argv[])
                 recordedSubmissionUs,
                 saturatingAdd(
                     priorSubmissionUs,
+                    unsignedField(fields, columns.displayPeriodUs)));
+        }
+        else if (normalPresentationLifecycle && !presented &&
+                 !nativeScheduledLifecycle && expectedHadPriorSubmission &&
+                 metrics.spacingLifecycleTimingTelemetryAvailable &&
+                 recordedSpacingRecheckUs != 0) {
+            // An attempted Present that returns dropped/cancelled retains the
+            // pre-call spacing check. recordSubmission() only overwrites these
+            // fields for successful presentations. Validate that retained
+            // boundary exactly; zeroing it would erase real worker evidence.
+            const uint64_t checkUs = recordedCorrectionWaitEndUs != 0 ?
+                recordedCorrectionWaitEndUs : recordedSpacingRecheckUs;
+            const uint64_t priorUs = referenceController->lastSubmissionUs();
+            expectedSubmissionSpacingUs = checkUs >= priorUs ? checkUs-priorUs : 0;
+            expectedSpacingMarginUs = signedDifference(checkUs,
+                saturatingAdd(spacingPriorSubmissionUs,
                     unsignedField(fields, columns.displayPeriodUs)));
         }
         metrics.submissionSpacingMismatches +=
@@ -15374,7 +15109,18 @@ int main(int argc, char* argv[])
             }
         }
 
+        const auto auditAfterAt=optionalUnsignedField(fields,traceColumn("buffer_after_at_us"));
+        VrrBufferAuditSnapshot referenceBufferAfter;
+        const auto captureBufferAfter=[&] {
+            referenceBufferAfter=referenceController->bufferAudit(auditAfterAt,referenceDecision.playoutDelayUs);
+            const auto at=(staleBeforeRenderLifecycle || staleAfterRenderLifecycle) ?
+                saturatingAdd(simulatedDecisionUs,positiveDifference(auditAfterAt,decisionUs)) :
+                saturatingAdd(simulatedSubmissionUs,positiveDifference(auditAfterAt,recordedSubmissionUs));
+            timelineDetails.bufferAfter=simulatedController->bufferAudit(at,simulatedDecision.playoutDelayUs);
+            timelineDetails.feedbackStats=simulatedController->intervalStats();
+        };
         if (staleBeforeRenderLifecycle || staleAfterRenderLifecycle) {
+            captureBufferAfter();
             // Both stale paths write their trace row before mutating the
             // controller. Compare the captured learned state at that same
             // point, then reproduce the mutation that affects the next row.
@@ -15469,6 +15215,31 @@ int main(int argc, char* argv[])
             simulatedController->notePresentation(observation);
         }
 
+        if (!staleBeforeRenderLifecycle && !staleAfterRenderLifecycle) captureBufferAfter();
+        if(optionalUnsignedField(fields,traceColumn("buffer_audit_revision"))>1)
+            ++metrics.bufferAuditMismatchedRows;
+        if(optionalUnsignedField(fields,traceColumn("buffer_audit_revision"))==1) {
+            ++metrics.bufferAuditComparedRows;
+            bool exact=true;
+            const auto checkAudit=[&](const char* name,auto expected) {
+                using Type=decltype(expected);
+                const QString key=QString::fromLatin1(name);
+                const auto recorded=std::is_signed<Type>::value ?
+                    QString::number(optionalSignedField(fields,traceColumn(name))) :
+                    QString::number(optionalUnsignedField(fields,traceColumn(name)));
+                const auto reconstructed=QString::number(expected);
+                if(recorded==reconstructed)return;
+                exact=false;++metrics.bufferAuditFieldMismatches[key];
+                if(metrics.bufferAuditFirstMismatches.size()<20)
+                    metrics.bufferAuditFirstMismatches.append(QJsonObject{{"frame",frameNumber},{"field",key},{"captured",recorded},{"reconstructed",reconstructed}});
+            };
+#define VRR_CHECK_CAPTURED_BUFFER_AUDIT(type,name,member) \
+            checkAudit("buffer_before_" #name,type(referenceBufferBefore.member)); \
+            checkAudit("buffer_after_" #name,type(referenceBufferAfter.member));
+            VRR_BUFFER_AUDIT_FIELDS(VRR_CHECK_CAPTURED_BUFFER_AUDIT)
+#undef VRR_CHECK_CAPTURED_BUFFER_AUDIT
+            metrics.bufferAuditMismatchedRows+=!exact;
+        }
         if (timelineFile.isOpen() &&
                 !writeTimelineRow(timelineFile, arrivalSequence,
                     frameNumber,
@@ -15485,6 +15256,8 @@ int main(int argc, char* argv[])
         std::fprintf(stderr, "Trace read failed: %s\n", qPrintable(error));
         return 1;
     }
+    if (!trajectorySuccessorAudit.complete())
+        ++metrics.invalidControllerLifecycleRows;
     if (!metrics.arrivalSequences.empty()) {
         std::sort(metrics.arrivalSequences.begin(),
                   metrics.arrivalSequences.end());
