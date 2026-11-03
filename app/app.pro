@@ -199,6 +199,11 @@ SOURCES += \
     streaming/input/gamepad.cpp \
     streaming/input/dualsensehaptics.cpp \
     streaming/input/dualsensehid.cpp \
+    streaming/input/steamcontroller/steamcontrollerattributes.cpp \
+    streaming/input/steamcontroller/steamcontrollercore.cpp \
+    streaming/input/steamcontroller/steamcontrollerlink.cpp \
+    streaming/input/steamcontroller/steamcontrollerhost.cpp \
+    streaming/input/steamcontroller/steamcontrollersdl.cpp \
     streaming/input/input.cpp \
     streaming/input/keyboard.cpp \
     streaming/input/mouse.cpp \
@@ -227,6 +232,13 @@ HEADERS += \
     streaming/video/videothreadpriority.h \
     streaming/video/timinggraph.h \
     streaming/input/dualsensehid.h \
+    streaming/input/steamcontroller/steamcontrollerprotocol.h \
+    streaming/input/steamcontroller/steamcontrollerattributes.h \
+    streaming/input/steamcontroller/steamcontrollercore.h \
+    streaming/input/steamcontroller/steamcontrollerlink.h \
+    streaming/input/rumbleroute.h \
+    streaming/input/steamcontroller/steamcontrollerhost.h \
+    streaming/input/steamcontroller/steamcontrollersdl.h \
     streaming/input/gamepadstickmerge.h \
     streaming/input/dualsensetriggers.h \
     ../third-party/saxense/packet.h \
@@ -301,6 +313,7 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/swframemapper.cpp \
         streaming/video/ffmpeg-renderers/pacer/pacer.cpp \
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.cpp \
+        streaming/video/ffmpeg-renderers/pacer/vrrpacingtrace.cpp \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.cpp \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtargetwaiter.cpp
 
@@ -316,17 +329,12 @@ ffmpeg {
         streaming/video/ffmpeg-renderers/pacer/vrrpacingworker.h \
         streaming/video/ffmpeg-renderers/ivrrframepresenter.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtypes.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/absorbedjitter.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/inputpercentilebuffer.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/inputbufferestimate.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/bufferaudit.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/rollingquantile.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputbuffer.h \
+        streaming/video/ffmpeg-renderers/pacer/vrr/inputgoalbuffer.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/phasetrajectory.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/presentationtiming.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/prediction.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/recentreadiness.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/readinesswindow.h \
-        streaming/video/ffmpeg-renderers/pacer/vrr/readinessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/smoothnessfeedback.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/vrrtimingcontroller.h \
         streaming/video/ffmpeg-renderers/pacer/vrr/inputlayercadence.h \
