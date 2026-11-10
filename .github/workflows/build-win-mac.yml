@@ -22,6 +22,14 @@ on:
         required: false
         type: boolean
         default: true
+      macos_archs:
+        required: false
+        type: string
+        default: "x86_64 arm64"
+      upload_symbols:
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       ci_version:
@@ -40,6 +48,16 @@ on:
         default: true
       build_macos:
         description: Include the macOS build
+        required: false
+        type: boolean
+        default: true
+      macos_archs:
+        description: macOS target architectures (arm64, x86_64, or x86_64 arm64)
+        required: false
+        type: string
+        default: "x86_64 arm64"
+      upload_symbols:
+        description: Upload separate debug symbols
         required: false
         type: boolean
         default: true
@@ -292,6 +310,8 @@ jobs:
         run: python3 -B -m unittest discover -s scripts/tests -p test_macos_bundle_signature.py -v
 
       - name: Build Package
+        env:
+          MACOS_ARCHS: ${{ inputs.macos_archs }}
         shell: pwsh
         run: |
           if ($Env:RUNNER_OS -eq "Windows") {
@@ -299,6 +319,16 @@ jobs:
           } else {
             bash scripts/generate-dmg.sh Release
           }
+
+      - name: Verify macOS target architectures
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          MACOS_ARCHS: ${{ inputs.macos_archs }}
+        run: |
+          set -euo pipefail
+          actual=$(lipo -archs build/build-Release/app/Moonlight.app/Contents/MacOS/Moonlight)
+          test "$(echo "$actual" | xargs -n1 | sort)" = "$(echo "$MACOS_ARCHS" | xargs -n1 | sort)"
 
       - name: Test nightly updater and macOS display timing
         if: runner.os == 'macOS' && contains(inputs.ci_version, '-daily.')
@@ -310,10 +340,12 @@ jobs:
           (cd build/nightly-tests-updates && qmake ../../tests/updates/updates.pro CONFIG+=release && make -j2 && ./tst_autoupdatechecker)
           (cd build/nightly-tests-timing && qmake ../../tests/vrr/macdisplaytiming.pro CONFIG+=release && make -j2 && ./tst_macdisplaytiming)
 
-      - name: Verify nightly universal macOS DMG
+      - name: Verify nightly macOS DMG
         if: runner.os == 'macOS' && contains(inputs.ci_version, '-daily.')
         timeout-minutes: 5
         shell: bash
+        env:
+          MACOS_ARCHS: ${{ inputs.macos_archs }}
         run: |
           set -euo pipefail
           dmg="build/installer-Release/Moonlight-$CI_VERSION.dmg"
@@ -325,7 +357,8 @@ jobs:
           app="$mount/Moonlight.app"
           test -d "$app"
           codesign --verify --deep --strict "$app"
-          lipo "$app/Contents/MacOS/Moonlight" -verify_arch x86_64 arm64
+          read -r -a architectures <<< "$MACOS_ARCHS"
+          lipo "$app/Contents/MacOS/Moonlight" -verify_arch "${architectures[@]}"
           version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
           test "$version" = "$(cat app/version.txt)"
           bundle=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")
@@ -336,7 +369,7 @@ jobs:
           test "$source" = "$(git rev-parse HEAD)"
           test -z "${SIGNING_IDENTITY:-}"
           test -z "${NOTARY_KEYCHAIN_PROFILE:-}"
-          echo 'Universal x86_64/arm64 DMG identity verified; no Developer ID signing or notarization requested.'
+          echo "DMG identity verified for $MACOS_ARCHS; no Developer ID signing or notarization requested."
 
       - name: Stage Windows installer bundle
         if: runner.os == 'Windows'
@@ -409,6 +442,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload Symbols
+        if: inputs.upload_symbols
         uses: actions/upload-artifact@v6
         with:
           name: zDevDbgSyms-${{ runner.os }}-${{ env.CI_VERSION }}

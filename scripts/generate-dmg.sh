@@ -11,6 +11,12 @@ if [ "$BUILD_CONFIG" != "Debug" ] && [ "$BUILD_CONFIG" != "Release" ]; then
   fail "Invalid build configuration - expected 'Debug' or 'Release'"
 fi
 
+MACOS_ARCHS=${MACOS_ARCHS:-"x86_64 arm64"}
+case "$MACOS_ARCHS" in
+  arm64|x86_64|"x86_64 arm64") ;;
+  *) fail "Invalid MACOS_ARCHS - expected arm64, x86_64, or x86_64 arm64" ;;
+esac
+
 BUILD_ROOT=$PWD/build
 SOURCE_ROOT=$PWD
 BUILD_FOLDER=$BUILD_ROOT/build-$BUILD_CONFIG
@@ -48,7 +54,7 @@ export LDFLAGS=-flto=thin
 
 echo Configuring the project
 pushd $BUILD_FOLDER
-qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" || fail "Qmake failed!"
+qmake $SOURCE_ROOT/moonlight-qt.pro QMAKE_APPLE_DEVICE_ARCHS="$MACOS_ARCHS" || fail "Qmake failed!"
 popd
 
 echo Compiling Moonlight in $BUILD_CONFIG configuration

@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @unittest.skipUnless(sys.platform == 'darwin', 'Requires macOS codesign')
 class MacosBundleSignatureTests(unittest.TestCase):
     def run_pipeline(self, version, corrupt_after_sign=False, missing_app_signature=False,
-                     missing_nested_signature=False):
+                     missing_nested_signature=False, macos_archs=None):
         temporary = tempfile.TemporaryDirectory(prefix='moonlight-dmg-signature-')
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -28,7 +28,8 @@ class MacosBundleSignatureTests(unittest.TestCase):
         tools.mkdir()
         self.write_tool(tools, 'git', '#!/bin/bash\necho 0123456789abcdef0123456789abcdef01234567\n')
         self.write_tool(tools, 'qmake', '''#!/usr/bin/env python3
-import os, pathlib, plistlib, shutil, subprocess
+import os, pathlib, plistlib, shutil, subprocess, sys
+pathlib.Path(os.environ['TEST_ROOT'], 'qmake-arguments').write_text('\\n'.join(sys.argv[1:]))
 bundle = pathlib.Path('app/Moonlight.app')
 (bundle / 'Contents/MacOS').mkdir(parents=True)
 (bundle / 'Contents/Helpers').mkdir()
@@ -72,6 +73,9 @@ printf '%s\\n' "$@" > "$TEST_ROOT/dmg-arguments"
 touch "$2/Moonlight.dmg"
 ''')
         environment = os.environ.copy()
+        environment.pop('MACOS_ARCHS', None)
+        if macos_archs is not None:
+            environment['MACOS_ARCHS'] = macos_archs
         environment.update(PATH=f'{tools}:{environment["PATH"]}', CI_VERSION=version,
                            SIGNING_IDENTITY='', SIGNING_PROVIDER_SHORTNAME='',
                            NOTARY_KEYCHAIN_PROFILE='', TEST_ROOT=str(root),
@@ -111,6 +115,16 @@ touch "$2/Moonlight.dmg"
     def test_unsigned_non_nightly_still_packages(self):
         root, result = self.run_pipeline('6.2.0')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((root / 'build/installer-Release/Moonlight-6.2.0.dmg').is_file())
+        self.assertIn('QMAKE_APPLE_DEVICE_ARCHS=x86_64 arm64',
+                      (root / 'qmake-arguments').read_text().splitlines())
+
+    def test_arm64_only_package(self):
+        root, result = self.run_pipeline('6.2.0', macos_archs='arm64')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = (root / 'qmake-arguments').read_text().splitlines()
+        self.assertIn('QMAKE_APPLE_DEVICE_ARCHS=arm64', arguments)
+        self.assertFalse(any('x86_64' in argument for argument in arguments))
         self.assertTrue((root / 'build/installer-Release/Moonlight-6.2.0.dmg').is_file())
 
     def test_missing_app_signature_is_created(self):
