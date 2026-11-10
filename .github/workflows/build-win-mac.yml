@@ -14,6 +14,10 @@ on:
         required: false
         type: string
         default: ""
+      build_windows:
+        required: false
+        type: boolean
+        default: true
       build_macos:
         required: false
         type: boolean
@@ -29,6 +33,11 @@ on:
         required: false
         type: string
         default: ""
+      build_windows:
+        description: Include the Windows build
+        required: false
+        type: boolean
+        default: true
       build_macos:
         description: Include the macOS build
         required: false
@@ -37,12 +46,13 @@ on:
 
 jobs:
   build:
+    if: inputs.build_windows || inputs.build_macos
     env:
       CI_VERSION: ${{ inputs.ci_version }}
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON(inputs.build_macos && '["windows-2025", "macos-26"]' || '["windows-2025"]') }}
+        os: ${{ fromJSON(inputs.build_windows && (inputs.build_macos && '["windows-2025", "macos-26"]' || '["windows-2025"]') || '["macos-26"]') }}
         qt_version: ['6.11.1']
 
     runs-on: ${{ matrix.os }}
