@@ -35,6 +35,10 @@ if [ "$SIGNING_IDENTITY" == "" ]; then
   SIGNING_IDENTITY=$SIGNING_PROVIDER_SHORTNAME
 fi
 
+if [ -n "$NOTARY_KEYCHAIN_PROFILE" ] && [ -z "$SIGNING_IDENTITY" ]; then
+  fail "Notarization requires a Developer ID signing identity"
+fi
+
 [ "$SIGNING_IDENTITY" == "" ] || git diff-index --quiet HEAD -- || fail "Signed release builds must not have unstaged changes!"
 
 echo Updating dependencies
@@ -115,10 +119,25 @@ fi
 
 if [ "$NOTARY_KEYCHAIN_PROFILE" != "" ]; then
   echo Uploading to App Notary service
-  xcrun notarytool submit --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" --wait $INSTALLER_FOLDER/Moonlight.dmg || fail "Notary submission failed"
+  NOTARY_ARGS=(--keychain-profile "$NOTARY_KEYCHAIN_PROFILE")
+  if [ -n "$NOTARY_KEYCHAIN" ]; then
+    NOTARY_ARGS+=(--keychain "$NOTARY_KEYCHAIN")
+  fi
+  xcrun notarytool submit "${NOTARY_ARGS[@]}" --wait --output-format json \
+    "$INSTALLER_FOLDER/Moonlight.dmg" > "$BUILD_ROOT/notarization.json" || fail "Notary submission failed"
+  python3 - "$BUILD_ROOT/notarization.json" <<'PY' || fail "Apple did not accept the notarization submission"
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    result = json.load(source)
+print('Notarization status:', result.get('status', 'unknown'))
+sys.exit(0 if result.get('status') == 'Accepted' else 1)
+PY
 
   echo Stapling notary ticket to DMG
-  xcrun stapler staple -v $INSTALLER_FOLDER/Moonlight.dmg || fail "Notary ticket stapling failed!"
+  xcrun stapler staple -v "$INSTALLER_FOLDER/Moonlight.dmg" || fail "Notary ticket stapling failed!"
+  xcrun stapler validate "$INSTALLER_FOLDER/Moonlight.dmg" || fail "Notary ticket validation failed!"
 fi
 
 mv $INSTALLER_FOLDER/Moonlight.dmg $INSTALLER_FOLDER/Moonlight-$VERSION.dmg

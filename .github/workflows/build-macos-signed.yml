@@ -1,0 +1,23 @@
+name: Build signed macOS ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_version:
+        description: Version string used for the DMG
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/build-win-mac.yml
+    with:
+      ci_version: ${{ inputs.ci_version }}
+      build_windows: false
+      build_macos: true
+      macos_archs: arm64
+      upload_symbols: false
+      sign_macos: true

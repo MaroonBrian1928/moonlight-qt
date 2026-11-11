@@ -30,6 +30,21 @@ on:
         required: false
         type: boolean
         default: true
+      sign_macos:
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      MACOS_CERTIFICATE_P12:
+        required: false
+      MACOS_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_NOTARY_KEY_P8:
+        required: false
+      APPLE_NOTARY_KEY_ID:
+        required: false
+      APPLE_NOTARY_ISSUER_ID:
+        required: false
   workflow_dispatch:
     inputs:
       ci_version:
@@ -61,10 +76,16 @@ on:
         required: false
         type: boolean
         default: true
+      sign_macos:
+        description: Sign with Developer ID and notarize with Apple
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   build:
     if: inputs.build_windows || inputs.build_macos
+    environment: ${{ inputs.sign_macos && 'macos-signing' || 'build' }}
     env:
       CI_VERSION: ${{ inputs.ci_version }}
     strategy:
@@ -76,6 +97,21 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
+      - name: Verify signing authorization
+        if: inputs.sign_macos
+        shell: bash
+        env:
+          BUILD_REPOSITORY: ${{ github.repository }}
+          BUILD_ACTOR: ${{ github.actor }}
+          BUILD_EVENT: ${{ github.event_name }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if [[ "$BUILD_REPOSITORY" != MaroonBrian1928/moonlight-qt || "$BUILD_ACTOR" != MaroonBrian1928 || "$BUILD_EVENT" != workflow_dispatch || -n "$SOURCE_REF" ]]; then
+            echo 'Signing requires an owner-triggered manual build of its selected workflow ref.' >&2
+            exit 1
+          fi
+
       - name: Enforce GitHub-hosted daily builds
         if: contains(inputs.ci_version, '-daily.')
         shell: pwsh
@@ -309,6 +345,51 @@ jobs:
         shell: bash
         run: python3 -B -m unittest discover -s scripts/tests -p test_macos_bundle_signature.py -v
 
+      - name: Configure Developer ID signing and notarization
+        if: runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request* ]]; then
+            echo 'Developer ID credentials require a push or manual build.' >&2
+            exit 1
+          fi
+          for name in CERTIFICATE_P12 CERTIFICATE_PASSWORD NOTARY_KEY_P8 NOTARY_KEY_ID NOTARY_ISSUER_ID; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing signing credential: $name" >&2
+              exit 1
+            fi
+          done
+          umask 077
+          keychain="$RUNNER_TEMP/moonlight-signing.keychain-db"
+          password=$(openssl rand -hex 32)
+          echo "::add-mask::$password"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/moonlight-signing.p12"
+          security import "$RUNNER_TEMP/moonlight-signing.p12" -P "$CERTIFICATE_PASSWORD" -k "$keychain" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" "$HOME/Library/Keychains/login.keychain-db"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Developer ID Application:/ {print $2}')
+          if [[ ! "$identity" =~ ^[A-Fa-f0-9]{40}$ ]]; then
+            echo 'Expected exactly one valid Developer ID Application certificate with its private key.' >&2
+            exit 1
+          fi
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/moonlight-notary.p8"
+          xcrun notarytool store-credentials moonlight-notary --keychain "$keychain" \
+            --key "$RUNNER_TEMP/moonlight-notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID"
+          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo 'NOTARY_KEYCHAIN_PROFILE=moonlight-notary' >> "$GITHUB_ENV"
+          echo "NOTARY_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
       - name: Build Package
         env:
           MACOS_ARCHS: ${{ inputs.macos_archs }}
@@ -329,6 +410,15 @@ jobs:
           set -euo pipefail
           actual=$(lipo -archs build/build-Release/app/Moonlight.app/Contents/MacOS/Moonlight)
           test "$(echo "$actual" | xargs -n1 | sort)" = "$(echo "$MACOS_ARCHS" | xargs -n1 | sort)"
+
+      - name: Verify notarized macOS package
+        if: runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="build/installer-Release/Moonlight-$CI_VERSION.dmg"
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
 
       - name: Test nightly updater and macOS display timing
         if: runner.os == 'macOS' && contains(inputs.ci_version, '-daily.')
@@ -367,9 +457,7 @@ jobs:
           test "$bundle" = "6.2.${CI_VERSION##*-daily.}"
           test "$identity" = "$CI_VERSION"
           test "$source" = "$(git rev-parse HEAD)"
-          test -z "${SIGNING_IDENTITY:-}"
-          test -z "${NOTARY_KEYCHAIN_PROFILE:-}"
-          echo "DMG identity verified for $MACOS_ARCHS; no Developer ID signing or notarization requested."
+          echo "DMG identity verified for $MACOS_ARCHS."
 
       - name: Stage Windows installer bundle
         if: runner.os == 'Windows'
@@ -450,3 +538,14 @@ jobs:
             build/installer-*/*.dsym/*
             build/symbols-*/*.pdb
           if-no-files-found: error
+
+      - name: Remove temporary signing credentials
+        if: always() && runner.os == 'macOS' && inputs.sign_macos
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/moonlight-signing.keychain-db"
+          if [[ -e "$keychain" ]]; then
+            security delete-keychain "$keychain"
+          fi
+          rm -f "$RUNNER_TEMP/moonlight-signing.p12" "$RUNNER_TEMP/moonlight-notary.p8"

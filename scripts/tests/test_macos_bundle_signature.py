@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 @unittest.skipUnless(sys.platform == 'darwin', 'Requires macOS codesign')
 class MacosBundleSignatureTests(unittest.TestCase):
     def run_pipeline(self, version, corrupt_after_sign=False, missing_app_signature=False,
-                     missing_nested_signature=False, macos_archs=None):
+                     missing_nested_signature=False, macos_archs=None, notary_status=None):
         temporary = tempfile.TemporaryDirectory(prefix='moonlight-dmg-signature-')
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -60,7 +60,11 @@ if os.environ.get('TEST_MISSING_NESTED_SIGNATURE') == '1':
 ''')
         self.write_tool(tools, 'codesign', '''#!/usr/bin/env python3
 import os, pathlib, subprocess, sys
-subprocess.run(['/usr/bin/codesign', *sys.argv[1:]], check=True)
+arguments = sys.argv[1:]
+if os.environ.get('TEST_NOTARY_STATUS'):
+    # Exercise notarization control flow with real ad hoc signatures.
+    arguments = [argument for argument in arguments if argument != '--timestamp']
+subprocess.run(['/usr/bin/codesign', *arguments], check=True)
 if '--sign' in sys.argv and os.environ.get('TEST_CORRUPT_AFTER_SIGN') == '1':
     with (pathlib.Path(sys.argv[-1]) / 'Contents/Helpers/Helper').open('ab') as output:
         output.write(b'invalidating nested code signature after signing')
@@ -72,6 +76,19 @@ printf '%s\\n' "$@" > "$TEST_ROOT/dmg-arguments"
 /usr/bin/codesign --verify --deep --strict "$1" || exit 1
 touch "$2/Moonlight.dmg"
 ''')
+        self.write_tool(tools, 'xcrun', '''#!/usr/bin/env python3
+import json, os, pathlib, sys
+root = pathlib.Path(os.environ['TEST_ROOT'])
+if sys.argv[1:3] == ['notarytool', 'submit']:
+    (root / 'notary-arguments').write_text(json.dumps(sys.argv[1:]))
+    print(json.dumps({'id': 'test-submission', 'status': os.environ['TEST_NOTARY_STATUS']}))
+elif sys.argv[1:3] == ['stapler', 'staple']:
+    (root / 'ticket-stapled').touch()
+elif sys.argv[1:3] == ['stapler', 'validate']:
+    (root / 'ticket-validated').touch()
+else:
+    sys.exit('Unexpected xcrun invocation')
+''')
         environment = os.environ.copy()
         environment.pop('MACOS_ARCHS', None)
         if macos_archs is not None:
@@ -82,6 +99,12 @@ touch "$2/Moonlight.dmg"
                            TEST_MISSING_APP_SIGNATURE=str(int(missing_app_signature)),
                            TEST_MISSING_NESTED_SIGNATURE=str(int(missing_nested_signature)),
                            TEST_CORRUPT_AFTER_SIGN=str(int(corrupt_after_sign)))
+        environment.pop('NOTARY_KEYCHAIN', None)
+        environment.pop('TEST_NOTARY_STATUS', None)
+        if notary_status is not None:
+            environment.update(SIGNING_IDENTITY='-', NOTARY_KEYCHAIN_PROFILE='test-notary',
+                               NOTARY_KEYCHAIN=str(root / 'test.keychain-db'),
+                               TEST_NOTARY_STATUS=notary_status)
         result = subprocess.run(['/bin/bash', str(ROOT / 'scripts/generate-dmg.sh'), 'Release'],
                                 cwd=root, env=environment, text=True, capture_output=True)
         return root, result
@@ -126,6 +149,22 @@ touch "$2/Moonlight.dmg"
         self.assertIn('QMAKE_APPLE_DEVICE_ARCHS=arm64', arguments)
         self.assertFalse(any('x86_64' in argument for argument in arguments))
         self.assertTrue((root / 'build/installer-Release/Moonlight-6.2.0.dmg').is_file())
+
+    def test_accepted_notarization_is_stapled_and_validated(self):
+        import json
+        root, result = self.run_pipeline('6.2.0', notary_status='Accepted')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        arguments = json.loads((root / 'notary-arguments').read_text())
+        self.assertEqual(arguments[arguments.index('--keychain') + 1], str(root / 'test.keychain-db'))
+        self.assertTrue((root / 'ticket-stapled').exists())
+        self.assertTrue((root / 'ticket-validated').exists())
+        self.assertTrue((root / 'build/installer-Release/Moonlight-6.2.0.dmg').is_file())
+
+    def test_rejected_notarization_stops_packaging(self):
+        root, result = self.run_pipeline('6.2.0', notary_status='Invalid')
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((root / 'ticket-stapled').exists())
+        self.assertFalse((root / 'build/installer-Release/Moonlight-6.2.0.dmg').exists())
 
     def test_missing_app_signature_is_created(self):
         root, result = self.run_pipeline('6.2.0-daily.183', missing_app_signature=True)
